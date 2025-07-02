@@ -185,57 +185,66 @@ app.add_middleware(
 )
 
 # Add debug logging middleware
-@app.middleware("http")
-async def debug_logging_middleware(request: Request, call_next):
-    """Log request/response details when debug mode is enabled."""
-    if not (DEBUG_MODE or VERBOSE):
-        return await call_next(request)
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class DebugLoggingMiddleware(BaseHTTPMiddleware):
+    """ASGI-compliant middleware for logging request/response details when debug mode is enabled."""
     
-    # Log request details
-    start_time = asyncio.get_event_loop().time()
-    
-    # Log basic request info
-    logger.debug(f"🔍 Incoming request: {request.method} {request.url}")
-    logger.debug(f"🔍 Headers: {dict(request.headers)}")
-    
-    # Log request body for POST requests
-    if request.method == "POST" and request.url.path.startswith("/v1/"):
+    async def dispatch(self, request: Request, call_next):
+        if not (DEBUG_MODE or VERBOSE):
+            return await call_next(request)
+        
+        # Log request details
+        start_time = asyncio.get_event_loop().time()
+        
+        # Log basic request info
+        logger.debug(f"🔍 Incoming request: {request.method} {request.url}")
+        logger.debug(f"🔍 Headers: {dict(request.headers)}")
+        
+        # For POST requests, try to log body (but don't break if we can't)
+        body_logged = False
+        if request.method == "POST" and request.url.path.startswith("/v1/"):
+            try:
+                # Only attempt to read body if it's reasonable size and content-type
+                content_length = request.headers.get("content-length")
+                if content_length and int(content_length) < 100000:  # Less than 100KB
+                    body = await request.body()
+                    if body:
+                        try:
+                            import json as json_lib
+                            parsed_body = json_lib.loads(body.decode())
+                            logger.debug(f"🔍 Request body: {json_lib.dumps(parsed_body, indent=2)}")
+                            body_logged = True
+                        except:
+                            logger.debug(f"🔍 Request body (raw): {body.decode()[:500]}...")
+                            body_logged = True
+            except Exception as e:
+                logger.debug(f"🔍 Could not read request body: {e}")
+        
+        if not body_logged and request.method == "POST":
+            logger.debug("🔍 Request body: [not logged - streaming or large payload]")
+        
+        # Process the request
         try:
-            body = await request.body()
-            if body:
-                # Decode and parse JSON to log it nicely
-                try:
-                    import json as json_lib
-                    parsed_body = json_lib.loads(body.decode())
-                    logger.debug(f"🔍 Request body: {json_lib.dumps(parsed_body, indent=2)}")
-                except:
-                    logger.debug(f"🔍 Request body (raw): {body.decode()}")
-                
-                # Recreate request with the body we consumed
-                async def receive():
-                    return {"type": "http.request", "body": body}
-                request._receive = receive
+            response = await call_next(request)
+            
+            # Log response details
+            end_time = asyncio.get_event_loop().time()
+            duration = (end_time - start_time) * 1000  # Convert to milliseconds
+            
+            logger.debug(f"🔍 Response: {response.status_code} in {duration:.2f}ms")
+            
+            return response
+            
         except Exception as e:
-            logger.debug(f"🔍 Could not read request body: {e}")
-    
-    # Process the request
-    try:
-        response = await call_next(request)
-        
-        # Log response details
-        end_time = asyncio.get_event_loop().time()
-        duration = (end_time - start_time) * 1000  # Convert to milliseconds
-        
-        logger.debug(f"🔍 Response: {response.status_code} in {duration:.2f}ms")
-        
-        return response
-        
-    except Exception as e:
-        end_time = asyncio.get_event_loop().time()
-        duration = (end_time - start_time) * 1000
-        
-        logger.debug(f"🔍 Request failed after {duration:.2f}ms: {e}")
-        raise
+            end_time = asyncio.get_event_loop().time()
+            duration = (end_time - start_time) * 1000
+            
+            logger.debug(f"🔍 Request failed after {duration:.2f}ms: {e}")
+            raise
+
+# Add the debug middleware
+app.add_middleware(DebugLoggingMiddleware)
 
 
 # Custom exception handler for 422 validation errors
@@ -341,6 +350,9 @@ async def generate_streaming_response(
         
         # Run Claude Code
         chunks_buffer = []
+        role_sent = False  # Track if we've sent the initial role chunk
+        content_sent = False  # Track if we've sent any content
+        
         async for chunk in claude_cli.run_completion(
             prompt=prompt,
             system_prompt=system_prompt,
@@ -353,43 +365,108 @@ async def generate_streaming_response(
             chunks_buffer.append(chunk)
             
             # Check if we have an assistant message
+            # Handle both old format (type/message structure) and new format (direct content)
+            content = None
             if chunk.get("type") == "assistant" and "message" in chunk:
+                # Old format: {"type": "assistant", "message": {"content": [...]}}
                 message = chunk["message"]
                 if isinstance(message, dict) and "content" in message:
                     content = message["content"]
+            elif "content" in chunk and isinstance(chunk["content"], list):
+                # New format: {"content": [TextBlock(...)]}  (converted AssistantMessage)
+                content = chunk["content"]
+            
+            if content is not None:
+                # Send initial role chunk if we haven't already
+                if not role_sent:
+                    initial_chunk = ChatCompletionStreamResponse(
+                        id=request_id,
+                        model=request.model,
+                        choices=[StreamChoice(
+                            index=0,
+                            delta={"role": "assistant", "content": ""},
+                            finish_reason=None
+                        )]
+                    )
+                    yield f"data: {initial_chunk.model_dump_json()}\n\n"
+                    role_sent = True
+                
+                # Handle content blocks
+                if isinstance(content, list):
+                    for block in content:
+                        # Handle TextBlock objects from Claude Code SDK
+                        if hasattr(block, 'text'):
+                            raw_text = block.text
+                        # Handle dictionary format for backward compatibility
+                        elif isinstance(block, dict) and block.get("type") == "text":
+                            raw_text = block.get("text", "")
+                        else:
+                            continue
+                            
+                        # Filter out tool usage and thinking blocks
+                        filtered_text = MessageAdapter.filter_content(raw_text)
+                            
+                        if filtered_text and not filtered_text.isspace():
+                            # Create streaming chunk
+                            stream_chunk = ChatCompletionStreamResponse(
+                                id=request_id,
+                                model=request.model,
+                                choices=[StreamChoice(
+                                    index=0,
+                                    delta={"content": filtered_text},
+                                    finish_reason=None
+                                )]
+                            )
+                            
+                            yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                            content_sent = True
+                
+                elif isinstance(content, str):
+                    # Filter out tool usage and thinking blocks
+                    filtered_content = MessageAdapter.filter_content(content)
                     
-                    # Handle content blocks
-                    if isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                text = block.get("text", "")
-                                
-                                # Create streaming chunk
-                                stream_chunk = ChatCompletionStreamResponse(
-                                    id=request_id,
-                                    model=request.model,
-                                    choices=[StreamChoice(
-                                        index=0,
-                                        delta={"content": text},
-                                        finish_reason=None
-                                    )]
-                                )
-                                
-                                yield f"data: {stream_chunk.model_dump_json()}\n\n"
-                    
-                    elif isinstance(content, str):
+                    if filtered_content and not filtered_content.isspace():
                         # Create streaming chunk
                         stream_chunk = ChatCompletionStreamResponse(
                             id=request_id,
                             model=request.model,
                             choices=[StreamChoice(
                                 index=0,
-                                delta={"content": content},
+                                delta={"content": filtered_content},
                                 finish_reason=None
                             )]
                         )
                         
                         yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                        content_sent = True
+        
+        # Handle case where no role was sent (send at least role chunk)
+        if not role_sent:
+            # Send role chunk with empty content if we never got any assistant messages
+            initial_chunk = ChatCompletionStreamResponse(
+                id=request_id,
+                model=request.model,
+                choices=[StreamChoice(
+                    index=0,
+                    delta={"role": "assistant", "content": ""},
+                    finish_reason=None
+                )]
+            )
+            yield f"data: {initial_chunk.model_dump_json()}\n\n"
+            role_sent = True
+        
+        # If we sent role but no content, send a minimal response
+        if role_sent and not content_sent:
+            fallback_chunk = ChatCompletionStreamResponse(
+                id=request_id,
+                model=request.model,
+                choices=[StreamChoice(
+                    index=0,
+                    delta={"content": "I'm unable to provide a response at the moment."},
+                    finish_reason=None
+                )]
+            )
+            yield f"data: {fallback_chunk.model_dump_json()}\n\n"
         
         # Extract assistant response from all chunks for session storage
         if actual_session_id and chunks_buffer:
@@ -522,10 +599,13 @@ async def chat_completions(
                 chunks.append(chunk)
             
             # Extract assistant message
-            assistant_content = claude_cli.parse_claude_message(chunks)
+            raw_assistant_content = claude_cli.parse_claude_message(chunks)
             
-            if not assistant_content:
+            if not raw_assistant_content:
                 raise HTTPException(status_code=500, detail="No response from Claude Code")
+            
+            # Filter out tool usage and thinking blocks
+            assistant_content = MessageAdapter.filter_content(raw_assistant_content)
             
             # Add assistant response to session if using session mode
             if actual_session_id:
