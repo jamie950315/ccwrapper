@@ -1,0 +1,10 @@
+version: '3'
+services:
+  claude-wrapper:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ~/.claude:/root/.claude
+    environment:
+      - PORT=8000
