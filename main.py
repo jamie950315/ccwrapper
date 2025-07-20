@@ -642,8 +642,14 @@ async def chat_completions(
 
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
     """List available models."""
+    # Check FastAPI API key if configured
+    await verify_api_key(request, credentials)
+    
     return {
         "object": "list",
         "data": [
