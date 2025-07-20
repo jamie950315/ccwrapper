@@ -32,6 +32,28 @@ jobs:
           # For PR comments, we need to checkout the PR head
           ref: ${{ github.event.issue.pull_request && format('refs/pull/{0}/head', github.event.issue.number) || github.ref }}
 
+      - name: Debug - Show checkout info
+        run: |
+          echo "Current branch: $(git branch --show-current)"
+          echo "HEAD commit: $(git rev-parse HEAD)"
+          echo "Working directory contents:"
+          ls -la
+          echo "GitHub event info:"
+          echo "Event name: ${{ github.event_name }}"
+          echo "Is PR: ${{ github.event.issue.pull_request != null }}"
+          if [ "${{ github.event.issue.pull_request }}" != "null" ]; then
+            echo "PR number: ${{ github.event.issue.number }}"
+          fi
+
+      - name: Check secrets
+        run: |
+          if [ -z "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}" ]; then
+            echo "ERROR: CLAUDE_CODE_OAUTH_TOKEN secret is not set!"
+            exit 1
+          else
+            echo "CLAUDE_CODE_OAUTH_TOKEN is configured"
+          fi
+
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@beta
