@@ -28,31 +28,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          # For PR comments, we need to checkout the PR head
-          ref: ${{ github.event.issue.pull_request && format('refs/pull/{0}/head', github.event.issue.number) || github.ref }}
-
-      - name: Debug - Show checkout info
-        run: |
-          echo "Current branch: $(git branch --show-current)"
-          echo "HEAD commit: $(git rev-parse HEAD)"
-          echo "Working directory contents:"
-          ls -la
-          echo "GitHub event info:"
-          echo "Event name: ${{ github.event_name }}"
-          echo "Is PR: ${{ github.event.issue.pull_request != null }}"
-          if [ "${{ github.event.issue.pull_request }}" != "null" ]; then
-            echo "PR number: ${{ github.event.issue.number }}"
-          fi
-
-      - name: Check secrets
-        run: |
-          if [ -z "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}" ]; then
-            echo "ERROR: CLAUDE_CODE_OAUTH_TOKEN secret is not set!"
-            exit 1
-          else
-            echo "CLAUDE_CODE_OAUTH_TOKEN is configured"
-          fi
+          fetch-depth: 20
+          # Let the Claude action handle PR checkout - just use default ref
 
       - name: Run Claude Code
         id: claude
