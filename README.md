@@ -1,791 +1,280 @@
-# Claude Code OpenAI API Wrapper
+# Claude Code OpenAI Wrapper
 
-An OpenAI API-compatible wrapper for Claude Code, allowing you to use Claude Code with any OpenAI client library. **Powered by the official Claude Agent SDK** with persistent client reuse, real-time streaming, and memory-safe operation on constrained hardware.
+Drop-in OpenAI API server backed by Claude. Point any OpenAI-compatible client at this wrapper and it talks to Claude via the official [Claude Agent SDK](https://docs.anthropic.com/en/docs/claude-code/sdk).
 
-## Version
+## Why
 
-**Current Version:** 2.3.0
-- **Claude 4.6 Models:** Default model updated to `claude-sonnet-4-6`
-- **Persistent SDK Client:** Reusable client avoids subprocess spawn per request
-- **Real-time Streaming:** Token-level `StreamEvent` deltas for instant feedback
-- **Memory Safety:** Hardened for constrained environments (Raspberry Pi, etc.)
-
-**Upgrading from v1.x?**
-1. Pull latest code: `git pull origin main`
-2. Update dependencies: `poetry install`
-3. Restart server - that's it!
-
-**Migration Resources:**
-- [MIGRATION_STATUS.md](./MIGRATION_STATUS.md) - Detailed v2.0.0 migration status
-- [UPGRADE_PLAN.md](./UPGRADE_PLAN.md) - Comprehensive migration strategy and technical details
-
-## Status
-
-🎉 **Production Ready** - All core features working and tested:
-- ✅ Chat completions endpoint with **official Claude Agent SDK** (persistent client reuse)
-- ✅ **Anthropic Messages API** (`/v1/messages`) for native compatibility
-- ✅ Streaming and non-streaming responses
-- ✅ Full OpenAI SDK compatibility
-- ✅ **Interactive landing page** with API explorer
-- ✅ **Multi-provider authentication** (API key, Bedrock, Vertex AI, CLI auth)
-- ✅ **System prompt support** via SDK options
-- ✅ Model selection support with validation
-- ✅ **Fast by default** - Tools disabled for OpenAI compatibility (5-10x faster)
-- ✅ Optional tool usage (Read, Write, Bash, etc.) when explicitly enabled
-- ✅ **Real-time cost and token tracking** from SDK
-- ✅ **Session continuity** with conversation history across requests
-- ✅ **Session management endpoints** for full session control
-- ✅ Health, auth status, and models endpoints
-- ✅ **Development mode** with auto-reload
-
-## Features
-
-### 🔥 **Core API Compatibility**
-- OpenAI-compatible `/v1/chat/completions` endpoint
-- Anthropic-compatible `/v1/messages` endpoint
-- Support for both streaming and non-streaming responses
-- Compatible with OpenAI Python SDK and all OpenAI client libraries
-- Automatic model validation and selection
-
-### 🛠 **Claude Agent SDK Integration**
-- **Official Claude Agent SDK** integration (v0.1.18)
-- **Dual-path architecture** - Persistent client for fast requests; stateless query for complex ones
-- **Real-time streaming** - Token-level `StreamEvent` deltas for instant feedback
-- **Real-time cost tracking** - actual costs from SDK metadata
-- **CJK-aware token estimation** - Accurate for multilingual content
-- **Session management** - proper session IDs and continuity
-- **Automatic client recycling** - Prevents subprocess memory growth over long uptimes
-
-### 🔐 **Multi-Provider Authentication**
-- **Automatic detection** of authentication method
-- **Claude CLI auth** - works with existing `claude auth` setup
-- **Direct API key** - `ANTHROPIC_API_KEY` environment variable
-- **AWS Bedrock** - enterprise authentication with AWS credentials
-- **Google Vertex AI** - GCP authentication support
-
-### ⚡ **Advanced Features**
-- **System prompt support** via SDK options
-- **Optional tool usage** - Enable Claude Code tools (Read, Write, Bash, etc.) when needed
-- **Fast default mode** - Tools disabled by default for OpenAI API compatibility
-- **Memory-safe for constrained environments** - Semaphore-limited concurrency, buffer cleanup, session caps, deadline-based timeouts
-- **Development mode** with auto-reload (`uvicorn --reload`)
-- **Interactive API key protection** - Optional security with auto-generated tokens
-- **Comprehensive logging** and debugging capabilities
-
-### 🌐 **Interactive Landing Page**
-- **API Explorer** at root URL (`http://localhost:8000/`)
-- **Live endpoint testing** - Expandable accordions fetch real-time data
-- **Light/dark theme toggle** - Persists preference in localStorage
-- **Copy-to-clipboard** - One-click copy for Quick Start commands
-- **Version badge** and GitHub link
+Many tools — Open WebUI, Continue, Cursor, custom apps — speak the OpenAI `/v1/chat/completions` protocol. This wrapper translates that protocol into Claude Agent SDK calls, so you can use Claude everywhere OpenAI is expected without changing client code.
 
 ## Quick Start
 
-Get started in under 2 minutes:
-
 ```bash
-# 1. Clone and setup the wrapper
-git clone https://github.com/RichardAtCT/claude-code-openai-wrapper
-cd claude-code-openai-wrapper
-poetry install  # Installs SDK with bundled Claude Code CLI
+git clone git@github.com:jamie950315/ccwrapper.git
+cd ccwrapper
+poetry install
 
-# 2. Authenticate (choose one method)
-export ANTHROPIC_API_KEY=your-api-key  # Recommended
-# OR use CLI auth: claude auth login
+# Authenticate (pick one)
+export ANTHROPIC_API_KEY=sk-ant-...
+# or: claude auth login
 
-# 3. Start the server
-poetry run uvicorn src.main:app --reload --port 8000
-
-# 4. Test it works
-poetry run python test_endpoints.py
+# Run
+poetry run uvicorn src.main:app --port 8000
 ```
 
-🎉 **That's it!** Your OpenAI-compatible Claude Code API is running on `http://localhost:8000`
-
-## Prerequisites
-
-1. **Python 3.10+**: Required for the server (supports Python 3.10, 3.11, 3.12, 3.13)
-
-2. **Poetry**: For dependency management
-   ```bash
-   # Install Poetry (if not already installed)
-   curl -sSL https://install.python-poetry.org | python3 -
-   ```
-
-3. **Authentication**: Choose one method:
-   - **Option A**: Set environment variable (Recommended)
-     ```bash
-     export ANTHROPIC_API_KEY=your-api-key
-     ```
-   - **Option B**: Authenticate via CLI
-     ```bash
-     claude auth login
-     ```
-   - **Option C**: Use AWS Bedrock or Google Vertex AI (see Configuration section)
-
-> **Note:** The Claude Code CLI is bundled with the SDK (v0.1.18+). No separate Node.js or npm installation required!
-
-## Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/RichardAtCT/claude-code-openai-wrapper
-   cd claude-code-openai-wrapper
-   ```
-
-2. Install dependencies with Poetry:
-   ```bash
-   poetry install
-   ```
-
-   This will create a virtual environment and install all dependencies.
-
-3. Configure environment:
-   ```bash
-   cp .env.example .env
-   # Edit .env with your preferences
-   ```
-
-## Configuration
-
-Edit the `.env` file:
-
-```env
-# Claude CLI path (usually just "claude")
-CLAUDE_CLI_PATH=claude
-
-# Explicit authentication method (optional)
-# Options: cli, api_key, bedrock, vertex
-# If not set, auto-detects based on available credentials
-# CLAUDE_AUTH_METHOD=cli
-
-# Optional API key for client authentication
-# If not set, server will prompt for interactive API key protection on startup
-# API_KEY=your-optional-api-key
-
-# Server port
-PORT=8000
-
-# Timeout in milliseconds
-MAX_TIMEOUT=600000
-
-# CORS origins
-CORS_ORIGINS=["*"]
-
-# Working directory for Claude Code (optional)
-# If not set, uses an isolated temporary directory for security
-# CLAUDE_CWD=/path/to/your/workspace
-```
-
-### 📁 **Working Directory Configuration**
-
-By default, Claude Code runs in an **isolated temporary directory** to prevent it from accessing the wrapper's source code. This enhances security by ensuring Claude Code only has access to the workspace you intend.
-
-**Configuration Options:**
-
-1. **Default (Recommended)**: Automatically creates a temporary isolated workspace
-   ```bash
-   # No configuration needed - secure by default
-   poetry run python main.py
-   ```
-
-2. **Custom Directory**: Set a specific workspace directory
-   ```bash
-   export CLAUDE_CWD=/path/to/your/project
-   poetry run python main.py
-   ```
-
-3. **Via .env file**: Add to your `.env` file
-   ```env
-   CLAUDE_CWD=/home/user/my-workspace
-   ```
-
-**Important Notes:**
-- The temporary directory is automatically cleaned up when the server stops
-- This prevents Claude Code from accidentally modifying the wrapper's own code
-- Cross-platform compatible (Windows, macOS, Linux)
-
-### 🔐 **API Security Configuration**
-
-The server supports **interactive API key protection** for secure remote access:
-
-1. **No API key set**: Server prompts "Enable API key protection? (y/N)" on startup
-   - Choose **No** (default): Server runs without authentication
-   - Choose **Yes**: Server generates and displays a secure API key
-
-2. **Environment API key set**: Uses the configured `API_KEY` without prompting
-
-```bash
-# Example: Interactive protection enabled
-poetry run python main.py
-
-# Output:
-# ============================================================
-# 🔐 API Endpoint Security Configuration
-# ============================================================
-# Would you like to protect your API endpoint with an API key?
-# This adds a security layer when accessing your server remotely.
-# 
-# Enable API key protection? (y/N): y
-# 
-# 🔑 API Key Generated!
-# ============================================================
-# API Key: Xf8k2mN9-vLp3qR5_zA7bW1cE4dY6sT0uI
-# ============================================================
-# 📋 IMPORTANT: Save this key - you'll need it for API calls!
-#    Example usage:
-#    curl -H "Authorization: Bearer Xf8k2mN9-vLp3qR5_zA7bW1cE4dY6sT0uI" \
-#         http://localhost:8000/v1/models
-# ============================================================
-```
-
-**Perfect for:**
-- 🏠 **Local development** - No authentication needed
-- 🌐 **Remote access** - Secure with generated tokens
-- 🔒 **VPN/Tailscale** - Add security layer for remote endpoints
-
-### 🛡️ **Rate Limiting**
-
-Built-in rate limiting protects against abuse and ensures fair usage:
-
-- **Chat Completions** (`/v1/chat/completions`): 10 requests/minute
-- **Debug Requests** (`/v1/debug/request`): 2 requests/minute
-- **Auth Status** (`/v1/auth/status`): 10 requests/minute
-- **Health Check** (`/health`): 30 requests/minute
-
-Rate limits are applied per IP address using a fixed window algorithm. When exceeded, the API returns HTTP 429 with a structured error response:
-
-```json
-{
-  "error": {
-    "message": "Rate limit exceeded. Try again in 60 seconds.",
-    "type": "rate_limit_exceeded",
-    "code": "too_many_requests",
-    "retry_after": 60
-  }
-}
-```
-
-Configure rate limiting through environment variables:
-
-```bash
-RATE_LIMIT_ENABLED=true
-RATE_LIMIT_CHAT_PER_MINUTE=10
-RATE_LIMIT_DEBUG_PER_MINUTE=2
-RATE_LIMIT_AUTH_PER_MINUTE=10
-RATE_LIMIT_HEALTH_PER_MINUTE=30
-```
-
-## Running the Server
-
-1. Verify Claude Code is installed and working:
-   ```bash
-   claude --version
-   claude --print --model claude-haiku-4-5-20251001 "Hello"  # Test with fastest model
-   ```
-
-2. Start the server:
-
-   **Development mode (recommended - auto-reloads on changes):**
-   ```bash
-   poetry run uvicorn src.main:app --reload --port 8000
-   ```
-
-   **Production mode:**
-   ```bash
-   poetry run python main.py
-   ```
-
-   **Port Options for production mode:**
-   - Default: Uses port 8000 (or PORT from .env)
-   - If port is in use, automatically finds next available port
-   - Specify custom port: `poetry run python main.py 9000`
-   - Set in environment: `PORT=9000 poetry run python main.py`
-
-## Docker
-
-Build and run the wrapper in a Docker container.
-
-### Build
-
-```bash
-docker build -t claude-wrapper:latest .
-```
-
-### Run
-
-**Production:**
-```bash
-docker run -d -p 8000:8000 \
-  -v ~/.claude:/root/.claude \
-  --name claude-wrapper \
-  claude-wrapper:latest
-```
-
-**With custom workspace:**
-```bash
-docker run -d -p 8000:8000 \
-  -v ~/.claude:/root/.claude \
-  -v /path/to/project:/workspace \
-  -e CLAUDE_CWD=/workspace \
-  claude-wrapper:latest
-```
-
-**Development (hot reload):**
-```bash
-docker run -d -p 8000:8000 \
-  -v ~/.claude:/root/.claude \
-  -v $(pwd):/app \
-  claude-wrapper:latest \
-  poetry run uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-### Docker Compose
-
-```yaml
-version: '3.8'
-services:
-  claude-wrapper:
-    build: .
-    ports:
-      - "8000:8000"
-    volumes:
-      - ~/.claude:/root/.claude
-    environment:
-      - PORT=8000
-      - MAX_TIMEOUT=600
-    restart: unless-stopped
-```
-
-Run: `docker-compose up -d` | Stop: `docker-compose down`
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `PORT` | Server port | `8000` |
-| `MAX_TIMEOUT` | Request timeout (ms) | `600000` |
-| `CLAUDE_CWD` | Working directory | temp dir |
-| `CLAUDE_AUTH_METHOD` | Auth method: `cli`, `api_key`, `bedrock`, `vertex` | auto-detect |
-| `DEFAULT_MODEL` | Default Claude model | `claude-sonnet-4-6` |
-| `ANTHROPIC_API_KEY` | Direct API key | - |
-| `API_KEYS` | Comma-separated client API keys | - |
-| `MAX_CONCURRENT_QUERIES` | Max concurrent SDK queries | `2` |
-| `CLIENT_RECYCLE_REQUESTS` | Recycle persistent client after N requests | `200` |
-
-### Management
-
-```bash
-docker logs -f claude-wrapper        # View logs
-docker stop claude-wrapper           # Stop
-docker start claude-wrapper          # Start
-docker rm claude-wrapper             # Remove
-```
-
-### Test
+Test it:
 
 ```bash
 curl http://localhost:8000/health
 curl http://localhost:8000/v1/models
 ```
 
-## Usage Examples
+## Usage
 
-### Using curl
-
-```bash
-# Basic chat completion (no auth)
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-sonnet-4-6",
-    "messages": [
-      {"role": "user", "content": "What is 2 + 2?"}
-    ]
-  }'
-
-# With API key protection (when enabled)
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer your-generated-api-key" \
-  -d '{
-    "model": "claude-sonnet-4-6",
-    "messages": [
-      {"role": "user", "content": "Write a Python hello world script"}
-    ],
-    "stream": true
-  }'
-```
-
-### Using OpenAI Python SDK
+### OpenAI Python SDK
 
 ```python
 from openai import OpenAI
 
-# Configure client (automatically detects auth requirements)
-client = OpenAI(
-    base_url="http://localhost:8000/v1",
-    api_key="your-api-key-if-required"  # Only needed if protection enabled
-)
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="any")
 
-# Alternative: Let examples auto-detect authentication
-# The wrapper's example files automatically check server auth status
-
-# Basic chat completion
 response = client.chat.completions.create(
     model="claude-sonnet-4-6",
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "What files are in the current directory?"}
-    ]
-)
-
-print(response.choices[0].message.content)
-# Output: Fast response without tool usage (default behaviour)
-
-# Enable tools when you need them (e.g., to read files)
-response = client.chat.completions.create(
-    model="claude-sonnet-4-6",
-    messages=[
-        {"role": "user", "content": "What files are in the current directory?"}
-    ],
-    extra_body={"enable_tools": True}  # Enable tools for file access
+    messages=[{"role": "user", "content": "Hello!"}],
 )
 print(response.choices[0].message.content)
-# Output: Claude will actually read your directory and list the files!
+```
 
-# Check real costs and tokens
-print(f"Cost: ${response.usage.total_tokens * 0.000003:.6f}")  # Real cost tracking
-print(f"Tokens: {response.usage.total_tokens} ({response.usage.prompt_tokens} + {response.usage.completion_tokens})")
+### Streaming
 
-# Streaming
+```python
 stream = client.chat.completions.create(
     model="claude-sonnet-4-6",
-    messages=[
-        {"role": "user", "content": "Explain quantum computing"}
-    ],
-    stream=True
+    messages=[{"role": "user", "content": "Explain recursion"}],
+    stream=True,
 )
-
 for chunk in stream:
     if chunk.choices[0].delta.content:
         print(chunk.choices[0].delta.content, end="")
 ```
 
-## Supported Models
+### Enable Tools
 
-All Claude models through November 2025 are supported:
-
-### Claude 4.6 Family (Latest)
-- **`claude-opus-4-6`** 🎯 Most Capable - Best for agents and complex coding tasks
-- **`claude-sonnet-4-6`** ⭐ Recommended (Default) - Best balance of speed and intelligence
-
-### Claude 4.5 Family (Legacy)
-- `claude-opus-4-5-20250929` - Previous generation Opus
-- `claude-sonnet-4-5-20250929` - Previous generation Sonnet
-- **`claude-haiku-4-5-20251001`** ⚡ Fast & Cheap - Near-frontier intelligence at lowest cost
-- `claude-haiku-4-5` - Alias for claude-haiku-4-5-20251001
-
-### Claude 4.1 & 4.0 Family (Legacy)
-- `claude-opus-4-1-20250805` - Upgraded Opus 4 with improved agentic tasks
-- `claude-opus-4-20250514` - Original Opus 4
-- `claude-sonnet-4-20250514` - Original Sonnet 4
-
-### Claude 3.x Family (Not Supported)
-- Claude 3.x models are listed for reference but **not supported** by the Claude Agent SDK
-
-**Note:** The model parameter is passed to Claude Code via the SDK's model selection.
-
-## Session Continuity 🆕
-
-The wrapper now supports **session continuity**, allowing you to maintain conversation context across multiple requests. This is a powerful feature that goes beyond the standard OpenAI API.
-
-### How It Works
-
-- **Stateless Mode** (default): Each request is independent, just like the standard OpenAI API
-- **Session Mode**: Include a `session_id` to maintain conversation history across requests
-
-### Using Sessions with OpenAI SDK
+Tools (file read/write, bash, etc.) are **disabled by default** for speed. Enable them per-request:
 
 ```python
-import openai
-
-client = openai.OpenAI(
-    base_url="http://localhost:8000/v1",
-    api_key="not-needed"
-)
-
-# Start a conversation with session continuity
-response1 = client.chat.completions.create(
+response = client.chat.completions.create(
     model="claude-sonnet-4-6",
-    messages=[
-        {"role": "user", "content": "Hello! My name is Alice and I'm learning Python."}
-    ],
-    extra_body={"session_id": "my-learning-session"}
+    messages=[{"role": "user", "content": "List files in the current directory"}],
+    extra_body={"enable_tools": True},
 )
-
-# Continue the conversation - Claude remembers the context
-response2 = client.chat.completions.create(
-    model="claude-sonnet-4-6",
-    messages=[
-        {"role": "user", "content": "What's my name and what am I learning?"}
-    ],
-    extra_body={"session_id": "my-learning-session"}  # Same session ID
-)
-# Claude will remember: "Your name is Alice and you're learning Python."
 ```
 
-### Using Sessions with curl
+### Sessions
+
+Maintain conversation context across requests with `session_id`:
+
+```python
+# First message
+client.chat.completions.create(
+    model="claude-sonnet-4-6",
+    messages=[{"role": "user", "content": "My name is Alice."}],
+    extra_body={"session_id": "chat-1"},
+)
+
+# Follow-up — Claude remembers the context
+client.chat.completions.create(
+    model="claude-sonnet-4-6",
+    messages=[{"role": "user", "content": "What's my name?"}],
+    extra_body={"session_id": "chat-1"},
+)
+```
+
+Sessions expire after 1 hour of inactivity. Each session holds up to 200 messages. Expired sessions are cleaned up automatically every 5 minutes.
+
+### curl
 
 ```bash
-# First message (add -H "Authorization: Bearer your-key" if auth enabled)
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "claude-sonnet-4-6",
-    "messages": [{"role": "user", "content": "My favourite color is blue."}],
-    "session_id": "my-session"
-  }'
-
-# Follow-up message - context is maintained
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-sonnet-4-6",
-    "messages": [{"role": "user", "content": "What's my favourite color?"}],
-    "session_id": "my-session"
+    "messages": [{"role": "user", "content": "What is 2+2?"}]
   }'
 ```
 
-### Session Management
+### Anthropic Messages API
 
-The wrapper provides endpoints to manage active sessions:
-
-- `GET /v1/sessions` - List all active sessions
-- `GET /v1/sessions/{session_id}` - Get session details
-- `DELETE /v1/sessions/{session_id}` - Delete a session
-- `GET /v1/sessions/stats` - Get session statistics
-
-```bash
-# List active sessions
-curl http://localhost:8000/v1/sessions
-
-# Get session details
-curl http://localhost:8000/v1/sessions/my-session
-
-# Delete a session
-curl -X DELETE http://localhost:8000/v1/sessions/my-session
-```
-
-### Session Features
-
-- **Automatic Expiration**: Sessions expire after 1 hour of inactivity
-- **Message Cap**: 200 messages per session to prevent unbounded memory growth
-- **Streaming Support**: Session continuity works with both streaming and non-streaming requests
-- **Memory Persistence**: Full conversation history is maintained within the session
-- **Efficient Storage**: Only active sessions are kept in memory; expired sessions auto-cleaned every 5 minutes
-
-### Examples
-
-See `examples/session_continuity.py` for comprehensive Python examples and `examples/session_curl_example.sh` for curl examples.
+A native `/v1/messages` endpoint is also available for clients that speak the Anthropic protocol directly.
 
 ## API Endpoints
 
-### Core Endpoints
-- `GET /` - Interactive landing page with API explorer
-- `POST /v1/chat/completions` - OpenAI-compatible chat completions (supports `session_id`)
-- `POST /v1/messages` - Anthropic-compatible messages endpoint
-- `GET /v1/models` - List available models
-- `GET /v1/auth/status` - Check authentication status and configuration
-- `GET /version` - Get API version
-- `GET /health` - Health check endpoint
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/chat/completions` | OpenAI-compatible chat (streaming & non-streaming) |
+| `POST` | `/v1/messages` | Anthropic-compatible messages |
+| `GET` | `/v1/models` | List available models |
+| `GET` | `/v1/sessions` | List active sessions |
+| `GET` | `/v1/sessions/{id}` | Get session details |
+| `DELETE` | `/v1/sessions/{id}` | Delete a session |
+| `GET` | `/v1/sessions/stats` | Session statistics |
+| `GET` | `/v1/tools` | List available tools with metadata |
+| `GET` | `/v1/tools/config` | Get tool configuration |
+| `POST` | `/v1/tools/config` | Update tool configuration |
+| `GET` | `/v1/auth/status` | Authentication info |
+| `POST` | `/v1/compatibility` | OpenAI compatibility report |
+| `POST` | `/v1/debug/request` | Request inspection |
+| `GET` | `/health` | Health check |
+| `GET` | `/version` | Server version |
+| `GET` | `/` | Interactive API explorer |
 
-### Session Management Endpoints 🆕
-- `GET /v1/sessions` - List all active sessions
-- `GET /v1/sessions/{session_id}` - Get detailed session information
-- `DELETE /v1/sessions/{session_id}` - Delete a specific session
-- `GET /v1/sessions/stats` - Get session manager statistics
+## Supported Models
 
-## Limitations & Roadmap
+| Model | Notes |
+|-------|-------|
+| `claude-sonnet-4-6` | **Default.** Best balance of speed and capability. |
+| `claude-opus-4-6` | Most capable. Best for agents and complex tasks. |
+| `claude-haiku-4-5-20251001` | Fastest and cheapest. |
+| `claude-opus-4-5-20250929` | Legacy Opus 4.5 |
+| `claude-sonnet-4-5-20250929` | Legacy Sonnet 4.5 |
+| `claude-opus-4-1-20250805` | Legacy Opus 4.1 |
+| `claude-opus-4-20250514` | Legacy Opus 4.0 |
+| `claude-sonnet-4-20250514` | Legacy Sonnet 4.0 |
 
-### 🚫 **Current Limitations**
-- **Images in messages** are converted to text placeholders
-- **Function calling** not supported (tools work automatically based on prompts)
-- **OpenAI parameters** not yet mapped: `temperature`, `top_p`, `max_tokens`, `logit_bias`, `presence_penalty`, `frequency_penalty`
-- **Multiple responses** (`n > 1`) not supported
+Claude 3.x models are **not supported** by the Claude Agent SDK.
 
-### 🛣 **Planned Enhancements** 
-- [ ] **Tool configuration** - allowed/disallowed tools endpoints  
-- [ ] **OpenAI parameter mapping** - temperature, top_p, max_tokens support
-- [ ] **Enhanced streaming** - better chunk handling
-- [ ] **MCP integration** - Model Context Protocol server support
+## Configuration
 
-### ✅ **Recent Improvements (v2.3.0)**
-- **Claude 4.6 model support**: Default model updated to `claude-sonnet-4-6`
-- **Persistent SDK client**: Reusable `ClaudeSDKClient` avoids subprocess spawn per request
-- **Real-time StreamEvent streaming**: Token-level deltas for instant response feedback
-- **Memory safety hardening**: Semaphore concurrency limits, buffer cleanup, session message caps, deadline-based timeouts, automatic client recycling
-- **CJK-aware token estimation**: Accurate for Chinese/Japanese/Korean content
-- **Auth race condition fix**: Env vars set once at init instead of per-request
-- **Graceful shutdown**: Persistent client disconnected and sessions cleared on exit
+Copy `.env.example` to `.env` and edit as needed. All settings have sensible defaults.
 
-### ✅ **v2.2.0 Features**
-- Interactive Landing Page with API explorer
-- Anthropic Messages API: Native `/v1/messages` endpoint
-- Explicit Auth Selection: `CLAUDE_AUTH_METHOD` env var
-- Tool Execution Fix: `enable_tools: true` now works correctly
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ANTHROPIC_API_KEY` | API key for Claude | — |
+| `CLAUDE_AUTH_METHOD` | Force auth method: `cli`, `api_key`, `bedrock`, `vertex` | auto-detect |
+| `API_KEY` | Protect wrapper endpoints with Bearer token | — |
+| `DEFAULT_MODEL` | Default model for requests | `claude-sonnet-4-6` |
+| `PORT` | Server port | `8000` |
+| `CLAUDE_CWD` | Working directory for Claude | isolated temp dir |
+| `MAX_TIMEOUT` | Request timeout (ms) | `600000` |
+| `MAX_CONCURRENT_QUERIES` | Concurrent SDK query limit | `2` |
+| `CLIENT_RECYCLE_REQUESTS` | Recycle persistent client after N requests | `200` |
+| `RATE_LIMIT_ENABLED` | Enable per-IP rate limiting | `true` |
+| `RATE_LIMIT_CHAT_PER_MINUTE` | Chat endpoint rate limit | `10` |
+| `CORS_ORIGINS` | Allowed CORS origins | `["*"]` |
 
-### ✅ **v2.0.0 - v2.1.0 Features**
-- Claude Agent SDK v0.1.18 with bundled CLI
-- Multi-provider auth (CLI, API key, Bedrock, Vertex AI)
-- Session continuity and management
-- Real-time cost and token tracking
-- System prompt support
+### Authentication
 
-## Troubleshooting
+The wrapper auto-detects your auth method, or you can set `CLAUDE_AUTH_METHOD` explicitly.
 
-1. **Claude CLI not found**:
-   ```bash
-   # Check Claude is in PATH
-   which claude
-   # Update CLAUDE_CLI_PATH in .env if needed
-   ```
+| Method | How |
+|--------|-----|
+| **API Key** (recommended) | `export ANTHROPIC_API_KEY=sk-ant-...` |
+| **CLI Auth** | `claude auth login` (uses your Pro/Max subscription) |
+| **AWS Bedrock** | Standard AWS credential chain |
+| **Google Vertex AI** | Standard GCP credential chain |
 
-2. **Authentication errors**:
-   ```bash
-   # Test authentication with fastest model
-   claude --print --model claude-haiku-4-5-20251001 "Hello"
-   # If this fails, re-authenticate if needed
-   ```
+### API Key Protection
 
-3. **Timeout errors**:
-   - Increase `MAX_TIMEOUT` in `.env`
-   - Note: Claude Code can take time for complex requests
+Optionally protect the wrapper's endpoints with a Bearer token:
 
-## Testing
-
-### 🧪 **Quick Test Suite**
-Test all endpoints with a simple script:
 ```bash
-# Make sure server is running first
-poetry run python test_endpoints.py
+# Set in environment
+export API_KEY=my-secret-key
+
+# Or let the server generate one interactively on startup
+poetry run python main.py
 ```
 
-### 📝 **Basic Test Suite**
-Run the comprehensive test suite:
-```bash
-# Make sure server is running first  
-poetry run python test_basic.py
+Clients then include `Authorization: Bearer my-secret-key` in requests.
 
-# With API key protection enabled, set TEST_API_KEY:
-TEST_API_KEY=your-generated-key poetry run python test_basic.py
+### Working Directory
+
+By default, Claude runs in an isolated temp directory so it can't access the wrapper's source code. Override with `CLAUDE_CWD`:
+
+```bash
+export CLAUDE_CWD=/path/to/your/project
 ```
 
-The test suite automatically detects whether API key protection is enabled and provides helpful guidance for providing the necessary authentication.
+## Architecture
 
-### 🔍 **Authentication Test**
-Check authentication status:
-```bash
-curl http://localhost:8000/v1/auth/status | python -m json.tool
+```
+Client (OpenAI SDK / curl / Open WebUI)
+  │
+  ▼
+FastAPI server (src/main.py)
+  │
+  ├─ parameter_validator.py   → validate & map OpenAI params
+  ├─ message_adapter.py       → convert message formats
+  ├─ session_manager.py       → inject conversation history
+  │
+  ▼
+claude_cli.py → Claude Agent SDK
+  │
+  ├─ Fast path: persistent ClaudeSDKClient (no tools, single turn)
+  └─ Slow path: stateless query() (tools, sessions, custom prompts)
 ```
 
-### ⚙️ **Development Tools**
+Key modules:
+
+- **`claude_cli.py`** — Dual-path SDK wrapper. Persistent client for simple requests, stateless `query()` for complex ones. Handles timeouts, client recycling, concurrency limits.
+- **`message_adapter.py`** — Converts between OpenAI and Claude formats. Strips thinking blocks, extracts `attempt_completion` results, CJK-aware token estimation.
+- **`session_manager.py`** — In-memory session store. 1-hour TTL, 200-message cap, background cleanup, thread-safe.
+- **`auth.py`** — Multi-provider auth with auto-detection.
+- **`tool_manager.py`** — Tool metadata and per-session allow/deny lists.
+- **`rate_limiter.py`** — Per-IP rate limiting via slowapi.
+- **`mcp_client.py`** — Optional Model Context Protocol integration.
+
+## Docker
+
 ```bash
-# Install development dependencies
+docker build -t ccwrapper .
+docker run -d -p 8000:8000 -e ANTHROPIC_API_KEY=sk-ant-... ccwrapper
+```
+
+With Docker Compose:
+
+```bash
+docker-compose up -d
+```
+
+Mount `~/.claude` for CLI auth, or set `ANTHROPIC_API_KEY` in the environment. Set `CLAUDE_CWD` and mount a volume if you need Claude to access a specific directory.
+
+## Development
+
+```bash
+# Install with dev dependencies
 poetry install --with dev
 
-# Format code
-poetry run black .
+# Dev server with hot reload
+poetry run uvicorn src.main:app --reload --port 8000
 
-# Run full tests (when implemented)
-poetry run pytest tests/
+# Tests
+poetry run pytest tests/ -v
+
+# Format
+poetry run black src tests
+
+# Type check
+poetry run mypy src --ignore-missing-imports
+
+# Security scan
+poetry run bandit -r src/ -ll -x tests
 ```
 
-### ✅ **Expected Results**
-All tests should show:
-- **4/4 endpoint tests passing**
-- **4/4 basic tests passing** 
-- **Authentication method detected** (claude_cli, anthropic, bedrock, or vertex)
-- **Real cost tracking** (e.g., $0.001-0.005 per test call)
-- **Accurate token counts** from SDK metadata
+## Current Limitations
+
+- Image content in messages is converted to text placeholders
+- OpenAI parameters `temperature`, `top_p`, `max_tokens`, `logit_bias`, `presence_penalty`, `frequency_penalty` are accepted but not mapped
+- `n > 1` (multiple completions) not supported
+- Function calling / tool_choice not supported (use `enable_tools` instead)
 
 ## Terms Compliance
 
-This wrapper is designed to be compliant with [Anthropic's Terms of Service](https://www.anthropic.com/legal).
+This wrapper requires your own Claude subscription or API access. It does not provide, share, or pool credentials. It is a format translator — converting OpenAI-shaped requests into Claude Agent SDK calls using your own authentication.
 
-### Requirements for Users
+- Uses the official Claude Agent SDK
+- Each user authenticates individually
+- No credential sharing, reselling, or data harvesting
 
-> **Important:** You must have your own valid Claude subscription or API access to use this wrapper.
+For programmatic/commercial use, `ANTHROPIC_API_KEY` is recommended (explicitly permitted under Anthropic's Commercial Terms). CLI auth via Pro/Max subscription is appropriate for personal use at moderate scale.
 
-- **Claude Pro or Max subscription** - For CLI authentication (`claude auth login`)
-- **Anthropic API key** - Available at [platform.claude.com](https://platform.claude.com)
-- **AWS Bedrock or Google Vertex AI** - For enterprise cloud authentication
-
-This wrapper does not provide Claude access - it provides an OpenAI-compatible interface to Claude services you already have access to.
-
-### How This Wrapper Works
-
-- **Uses the official Claude Agent SDK** - The same SDK Anthropic provides for developers
-- **Each user authenticates individually** - No credential sharing or pooling
-- **Format translation only** - Converts OpenAI-format requests to Claude SDK calls
-- **No reselling** - Users access Claude through their own subscriptions/API keys
-
-### Personal vs Commercial Use
-
-| Use Case | Recommended Authentication | Notes |
-|----------|---------------------------|-------|
-| Personal projects | CLI Auth (Pro/Max) or API Key | Acceptable at moderate scale |
-| Business/Commercial | API Key, Bedrock, or Vertex AI | Use [platform.claude.com](https://platform.claude.com) |
-| High-scale applications | Bedrock or Vertex AI | Enterprise authentication recommended |
-
-**Note on Consumer Plans:** Claude Pro and Max subscriptions are primarily designed for individual, interactive use. Using them through wrappers or automated implementations is acceptable for personal projects at moderate scale. For business use or applications that scale significantly, Anthropic's commercial API offerings at [platform.claude.com](https://platform.claude.com) are more appropriate.
-
-### Authentication Methods
-
-| Method | Terms | Compliance |
-|--------|-------|------------|
-| `ANTHROPIC_API_KEY` | Commercial Terms | Explicitly allowed for programmatic access |
-| AWS Bedrock | Commercial Terms | Explicitly allowed for programmatic access |
-| Google Vertex AI | Commercial Terms | Explicitly allowed for programmatic access |
-| CLI Auth (Pro/Max) | Consumer Terms | Uses official SDK with official auth methods |
-
-### CLI Authentication Note
-
-Using CLI auth (`claude auth login`) with this wrapper is functionally equivalent to using Claude Code directly - both use the Claude Agent SDK with your personal subscription. Anthropic provides the SDK with CLI auth support, and this wrapper simply provides an alternative interface format.
-
-### What This Wrapper Does NOT Do
-
-- Does not share or pool credentials between users
-- Does not include or expose API keys or credentials
-- Does not resell API access
-- Does not train competing AI models
-- Does not scrape or harvest data
-- Does not bypass authentication or rate limits
-
-### User Responsibilities
-
-By using this wrapper, you agree to:
-- Comply with [Anthropic's Terms of Service](https://www.anthropic.com/legal/consumer-terms)
-- Comply with [Anthropic's Usage Policy](https://www.anthropic.com/legal/aup)
-- Use your own valid Claude subscription or API access
-- Not share your credentials with others
-- Use commercial API access for business applications
-
-### Disclaimer
-
-This is an independent open-source project, not affiliated with or endorsed by Anthropic. Users are responsible for ensuring their own usage complies with Anthropic's terms. Anthropic reserves the right to modify their Terms of Service at any time.
-
-When in doubt, use `ANTHROPIC_API_KEY` authentication which is explicitly permitted for programmatic access under the Commercial Terms.
-
-For Anthropic's official terms, see:
-- [Usage Policy](https://www.anthropic.com/legal/aup)
-- [Consumer Terms](https://www.anthropic.com/legal/consumer-terms)
-- [Commercial Terms](https://www.anthropic.com/legal/commercial-terms)
-
-## Licence
-
-MIT Licence
-
-## Contributing
-
-Contributions are welcome! Please open an issue or submit a pull request.
+See Anthropic's [Usage Policy](https://www.anthropic.com/legal/aup), [Consumer Terms](https://www.anthropic.com/legal/consumer-terms), and [Commercial Terms](https://www.anthropic.com/legal/commercial-terms).
