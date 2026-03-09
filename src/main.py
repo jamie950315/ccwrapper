@@ -128,6 +128,7 @@ claude_cli = ClaudeCodeCLI(
 )
 
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Verify Claude Code authentication and CLI on startup."""
@@ -194,7 +195,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # Cleanup on shutdown
-    logger.info("Shutting down session manager...")
+    logger.info("Shutting down...")
+    await claude_cli.shutdown()
     session_manager.shutdown()
 
 
@@ -392,6 +394,7 @@ async def generate_streaming_response(
     request: ChatCompletionRequest, request_id: str, claude_headers: Optional[Dict[str, Any]] = None
 ) -> AsyncGenerator[str, None]:
     """Generate SSE formatted streaming response."""
+    chunks_buffer: list = []
     try:
         # Process messages with session management
         all_messages, actual_session_id = session_manager.process_messages(
@@ -428,10 +431,9 @@ async def generate_streaming_response(
 
         # Handle tools - disabled by default for OpenAI compatibility
         if not request.enable_tools:
-            # Disable all tools by using CLAUDE_TOOLS constant
-            claude_options["disallowed_tools"] = CLAUDE_TOOLS
+            claude_options["allowed_tools"] = []  # Empty list = no tools
             claude_options["max_turns"] = 1  # Single turn for Q&A
-            logger.info("Tools disabled (default behavior for OpenAI compatibility)")
+            logger.debug("Tools disabled (default behavior for OpenAI compatibility)")
         else:
             # Enable tools - use default safe subset (Read, Glob, Grep, Bash, Write, Edit)
             claude_options["allowed_tools"] = DEFAULT_ALLOWED_TOOLS
@@ -440,9 +442,9 @@ async def generate_streaming_response(
             logger.info(f"Tools enabled by user request: {DEFAULT_ALLOWED_TOOLS}")
 
         # Run Claude Code
-        chunks_buffer = []
         role_sent = False  # Track if we've sent the initial role chunk
         content_sent = False  # Track if we've sent any content
+        streamed_via_events = False  # Track if we got real-time StreamEvents
 
         async for chunk in claude_cli.run_completion(
             prompt=prompt,
@@ -454,18 +456,70 @@ async def generate_streaming_response(
             permission_mode=claude_options.get("permission_mode"),
             stream=True,
         ):
-            chunks_buffer.append(chunk)
+            # --- Handle StreamEvent (token-level delta) for real-time streaming ---
+            stream_event = chunk.get("event") if isinstance(chunk, dict) else None
 
-            # Check if we have an assistant message
-            # Handle both old format (type/message structure) and new format (direct content)
+            # Only buffer non-StreamEvent messages (AssistantMessage, ResultMessage)
+            # needed by parse_claude_message later. StreamEvents are high-frequency
+            # token deltas that would waste memory if buffered.
+            if stream_event is None:
+                chunks_buffer.append(chunk)
+            if stream_event is not None:
+                event_type = stream_event.get("type", "") if isinstance(stream_event, dict) else ""
+
+                # content_block_delta with text delta = incremental token
+                if event_type == "content_block_delta":
+                    delta = stream_event.get("delta", {})
+                    delta_type = delta.get("type", "")
+
+                    if delta_type == "text_delta":
+                        delta_text = delta.get("text", "")
+                        if delta_text:
+                            # Send initial role chunk if we haven't already
+                            if not role_sent:
+                                initial_chunk = ChatCompletionStreamResponse(
+                                    id=request_id,
+                                    model=request.model,
+                                    choices=[
+                                        StreamChoice(
+                                            index=0,
+                                            delta={"role": "assistant", "content": ""},
+                                            finish_reason=None,
+                                        )
+                                    ],
+                                )
+                                yield f"data: {initial_chunk.model_dump_json()}\n\n"
+                                role_sent = True
+
+                            stream_chunk = ChatCompletionStreamResponse(
+                                id=request_id,
+                                model=request.model,
+                                choices=[
+                                    StreamChoice(
+                                        index=0,
+                                        delta={"content": delta_text},
+                                        finish_reason=None,
+                                    )
+                                ],
+                            )
+                            yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                            content_sent = True
+                            streamed_via_events = True
+
+                # Skip other stream event types (content_block_start, message_start, etc.)
+                continue
+
+            # --- Handle complete AssistantMessage (fallback when no StreamEvents) ---
+            # Skip if we already streamed content via StreamEvents to avoid duplicates
+            if streamed_via_events:
+                continue
+
             content = None
             if chunk.get("type") == "assistant" and "message" in chunk:
-                # Old format: {"type": "assistant", "message": {"content": [...]}}
                 message = chunk["message"]
                 if isinstance(message, dict) and "content" in message:
                     content = message["content"]
             elif "content" in chunk and isinstance(chunk["content"], list):
-                # New format: {"content": [TextBlock(...)]}  (converted AssistantMessage)
                 content = chunk["content"]
 
             if content is not None:
@@ -488,20 +542,16 @@ async def generate_streaming_response(
                 # Handle content blocks
                 if isinstance(content, list):
                     for block in content:
-                        # Handle TextBlock objects from Claude Agent SDK
                         if hasattr(block, "text"):
                             raw_text = block.text
-                        # Handle dictionary format for backward compatibility
                         elif isinstance(block, dict) and block.get("type") == "text":
                             raw_text = block.get("text", "")
                         else:
                             continue
 
-                        # Filter out tool usage and thinking blocks
                         filtered_text = MessageAdapter.filter_content(raw_text)
 
                         if filtered_text and not filtered_text.isspace():
-                            # Create streaming chunk
                             stream_chunk = ChatCompletionStreamResponse(
                                 id=request_id,
                                 model=request.model,
@@ -518,11 +568,9 @@ async def generate_streaming_response(
                             content_sent = True
 
                 elif isinstance(content, str):
-                    # Filter out tool usage and thinking blocks
                     filtered_content = MessageAdapter.filter_content(content)
 
                     if filtered_content and not filtered_content.isspace():
-                        # Create streaming chunk
                         stream_chunk = ChatCompletionStreamResponse(
                             id=request_id,
                             model=request.model,
@@ -576,10 +624,12 @@ async def generate_streaming_response(
                 assistant_message = Message(role="assistant", content=assistant_content)
                 session_manager.add_assistant_response(actual_session_id, assistant_message)
 
+        # Free buffer immediately — can be large for long responses
+        chunks_buffer.clear()
+
         # Prepare usage data if requested
         usage_data = None
         if request.stream_options and request.stream_options.include_usage:
-            # Estimate token usage based on prompt and completion
             completion_text = assistant_content or ""
             token_usage = claude_cli.estimate_token_usage(prompt, completion_text, request.model)
             usage_data = Usage(
@@ -603,6 +653,9 @@ async def generate_streaming_response(
         logger.error(f"Streaming error: {e}")
         error_chunk = {"error": {"message": str(e), "type": "streaming_error"}}
         yield f"data: {json.dumps(error_chunk)}\n\n"
+    finally:
+        # Ensure buffer is freed even on error/client disconnect
+        chunks_buffer.clear()
 
 
 @app.post("/v1/chat/completions")
@@ -690,10 +743,9 @@ async def chat_completions(
 
             # Handle tools - disabled by default for OpenAI compatibility
             if not request_body.enable_tools:
-                # Disable all tools by using CLAUDE_TOOLS constant
-                claude_options["disallowed_tools"] = CLAUDE_TOOLS
+                claude_options["allowed_tools"] = []  # Empty list = no tools
                 claude_options["max_turns"] = 1  # Single turn for Q&A
-                logger.info("Tools disabled (default behavior for OpenAI compatibility)")
+                logger.debug("Tools disabled (default behavior for OpenAI compatibility)")
             else:
                 # Enable tools - use default safe subset (Read, Glob, Grep, Bash, Write, Edit)
                 claude_options["allowed_tools"] = DEFAULT_ALLOWED_TOOLS
@@ -715,8 +767,9 @@ async def chat_completions(
             ):
                 chunks.append(chunk)
 
-            # Extract assistant message
+            # Extract assistant message and free buffer
             raw_assistant_content = claude_cli.parse_claude_message(chunks)
+            chunks.clear()
 
             if not raw_assistant_content:
                 raise HTTPException(status_code=500, detail="No response from Claude Code")
@@ -823,8 +876,9 @@ async def anthropic_messages(
         ):
             chunks.append(chunk)
 
-        # Extract assistant message
+        # Extract assistant message and free buffer
         raw_assistant_content = claude_cli.parse_claude_message(chunks)
+        chunks.clear()
 
         if not raw_assistant_content:
             raise HTTPException(status_code=500, detail="No response from Claude Code")

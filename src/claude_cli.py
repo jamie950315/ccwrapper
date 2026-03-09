@@ -1,4 +1,7 @@
 import os
+import asyncio
+import time
+import uuid
 import tempfile
 import atexit
 import shutil
@@ -6,9 +9,25 @@ from typing import AsyncGenerator, Dict, Any, Optional, List
 from pathlib import Path
 import logging
 
-from claude_agent_sdk import query, ClaudeAgentOptions
+from claude_agent_sdk import query, ClaudeAgentOptions, ClaudeSDKClient
 
 logger = logging.getLogger(__name__)
+
+# Default system prompt used when no custom prompt is provided
+_DEFAULT_SYSTEM_PROMPT = "You are a helpful AI assistant."
+
+# Limit concurrent SDK queries to prevent memory exhaustion.
+MAX_CONCURRENT_QUERIES = int(os.getenv("MAX_CONCURRENT_QUERIES", "2"))
+_query_semaphore = asyncio.Semaphore(MAX_CONCURRENT_QUERIES)
+
+
+def _to_dict(message: Any) -> Dict[str, Any]:
+    """Convert an SDK message object to a dict for consistent handling."""
+    if isinstance(message, dict):
+        return message
+    if hasattr(message, "__dict__"):
+        return {k: v for k, v in vars(message).items() if not k.startswith("_")}
+    return message
 
 
 class ClaudeCodeCLI:
@@ -20,7 +39,6 @@ class ClaudeCodeCLI:
         # Otherwise create an isolated temp directory
         if cwd:
             self.cwd = Path(cwd)
-            # Check if the directory exists
             if not self.cwd.exists():
                 logger.error(f"ERROR: Specified working directory does not exist: {self.cwd}")
                 logger.error(
@@ -30,12 +48,9 @@ class ClaudeCodeCLI:
             else:
                 logger.info(f"Using CLAUDE_CWD: {self.cwd}")
         else:
-            # Create isolated temp directory (cross-platform)
             self.temp_dir = tempfile.mkdtemp(prefix="claude_code_workspace_")
             self.cwd = Path(self.temp_dir)
             logger.info(f"Using temporary isolated workspace: {self.cwd}")
-
-            # Register cleanup function to remove temp dir on exit
             atexit.register(self._cleanup_temp_dir)
 
         # Import auth manager
@@ -48,36 +63,121 @@ class ClaudeCodeCLI:
         else:
             logger.info(f"Claude Code authentication method: {auth_info.get('method', 'unknown')}")
 
-        # Store auth environment variables for SDK
+        # Set auth environment variables once for the process lifetime.
+        # This avoids per-request env manipulation which is not thread-safe.
         self.claude_env_vars = auth_manager.get_claude_code_env_vars()
+        for key, value in self.claude_env_vars.items():
+            os.environ[key] = value
 
-    async def verify_cli(self) -> bool:
-        """Verify Claude Agent SDK is working and authenticated."""
-        try:
-            # Test SDK with a simple query
-            logger.info("Testing Claude Agent SDK...")
+        # Persistent SDK client — one subprocess reused across all requests.
+        # Each request uses a unique session_id so they don't share context.
+        self._client: Optional[ClaudeSDKClient] = None
+        self._client_lock = asyncio.Lock()
+        self._client_request_count = 0
+        # Recycle the persistent client every N requests to prevent subprocess memory growth.
+        self._client_max_requests = int(os.getenv("CLIENT_RECYCLE_REQUESTS", "200"))
 
-            messages = []
-            async for message in query(
-                prompt="Hello",
-                options=ClaudeAgentOptions(
+    async def _ensure_client(self) -> ClaudeSDKClient:
+        """Get or create the persistent ClaudeSDKClient.
+
+        Automatically recycles the client after _client_max_requests to
+        prevent subprocess memory growth over long uptimes.
+        """
+        async with self._client_lock:
+            # Recycle if request count exceeded
+            if (self._client is not None
+                    and self._client_request_count >= self._client_max_requests):
+                logger.info(
+                    f"Recycling persistent client after {self._client_request_count} requests"
+                )
+                try:
+                    await self._client.disconnect()
+                except Exception:
+                    pass
+                self._client = None
+                self._client_request_count = 0
+
+            if self._client is None:
+                logger.info("Creating persistent ClaudeSDKClient...")
+                opts = ClaudeAgentOptions(
                     max_turns=1,
                     cwd=self.cwd,
-                    system_prompt={"type": "preset", "preset": "claude_code"},
-                ),
-            ):
-                messages.append(message)
-                # Break early on first response to speed up verification
-                # Handle both dict and object types
-                msg_type = (
-                    getattr(message, "type", None)
-                    if hasattr(message, "type")
-                    else message.get("type") if isinstance(message, dict) else None
+                    allowed_tools=[],
+                    include_partial_messages=True,
+                    system_prompt={"type": "text", "text": _DEFAULT_SYSTEM_PROMPT},
                 )
-                if msg_type == "assistant":
+                self._client = ClaudeSDKClient(options=opts)
+                await self._client.connect()
+                self._client_request_count = 0
+                logger.info("✅ Persistent ClaudeSDKClient connected (~400MB, reused)")
+            return self._client
+
+    async def _reset_client(self):
+        """Reset client on error so next request creates a fresh one."""
+        async with self._client_lock:
+            if self._client is not None:
+                try:
+                    await self._client.disconnect()
+                except Exception:
+                    pass
+                self._client = None
+                self._client_request_count = 0
+                logger.info("Persistent client reset")
+
+    async def shutdown(self):
+        """Disconnect persistent client on server shutdown."""
+        await self._reset_client()
+        logger.info("ClaudeCodeCLI shutdown complete")
+
+    def _can_use_persistent_client(
+        self,
+        system_prompt: Optional[str],
+        max_turns: int,
+        allowed_tools: Optional[List[str]],
+        disallowed_tools: Optional[List[str]],
+        permission_mode: Optional[str],
+    ) -> bool:
+        """Check if request matches persistent client's fixed options.
+
+        The persistent client is configured with allowed_tools=[], max_turns=1,
+        and the default system prompt. We allow allowed_tools=None here because
+        main.py always passes [] explicitly for the default (no-tools) path;
+        None would only arrive from direct callers that didn't specify tools,
+        which is compatible with the client's empty-tools configuration.
+        """
+        if system_prompt is not None:
+            return False
+        if max_turns != 1:
+            return False
+        if allowed_tools is not None and allowed_tools != []:
+            return False
+        if disallowed_tools is not None:
+            return False
+        if permission_mode is not None:
+            return False
+        return True
+
+    async def verify_cli(self) -> bool:
+        """Verify Claude Agent SDK is working and authenticated.
+
+        Also establishes the persistent client for subsequent requests.
+        """
+        try:
+            logger.info("Testing Claude Agent SDK...")
+            client = await self._ensure_client()
+
+            sid = uuid.uuid4().hex[:8]
+            await client.query("Hello", session_id=sid)
+
+            got_response = False
+            async for message in client.receive_messages():
+                name = type(message).__name__
+                if name in ("AssistantMessage", "StreamEvent"):
+                    got_response = True
+                if name == "ResultMessage":
                     break
 
-            if messages:
+            if got_response:
                 logger.info("✅ Claude Agent SDK verified successfully")
                 return True
             else:
@@ -86,6 +186,7 @@ class ClaudeCodeCLI:
 
         except Exception as e:
             logger.error(f"Claude Agent SDK verification failed: {e}")
+            await self._reset_client()
             logger.warning("Please ensure Claude Code is installed and authenticated:")
             logger.warning("  1. Install: npm install -g @anthropic-ai/claude-code")
             logger.warning("  2. Set ANTHROPIC_API_KEY environment variable")
@@ -108,83 +209,25 @@ class ClaudeCodeCLI:
         """Run Claude Agent using the Python SDK and yield response chunks."""
 
         try:
-            # Set authentication environment variables (if any)
-            original_env = {}
-            if self.claude_env_vars:  # Only set env vars if we have any
-                for key, value in self.claude_env_vars.items():
-                    original_env[key] = os.environ.get(key)
-                    os.environ[key] = value
+            use_persistent = self._can_use_persistent_client(
+                system_prompt, max_turns, allowed_tools, disallowed_tools,
+                permission_mode,
+            )
 
-            try:
-                # Build SDK options
-                options = ClaudeAgentOptions(max_turns=max_turns, cwd=self.cwd)
-
-                # Set model if specified
-                if model:
-                    options.model = model
-
-                # Set system prompt - CLAUDE AGENT SDK STRUCTURED FORMAT
-                # Use structured format as per SDK documentation
-                if system_prompt:
-                    options.system_prompt = {"type": "text", "text": system_prompt}
+            async with _query_semaphore:
+                if use_persistent and not session_id and not continue_session:
+                    async for msg in self._run_via_client(prompt):
+                        yield msg
                 else:
-                    # Use Claude Code preset to maintain expected behavior
-                    options.system_prompt = {"type": "preset", "preset": "claude_code"}
-
-                # Set tool restrictions
-                if allowed_tools:
-                    options.allowed_tools = allowed_tools
-                if disallowed_tools:
-                    options.disallowed_tools = disallowed_tools
-
-                # Set permission mode (needed for tool execution in API context)
-                if permission_mode:
-                    options.permission_mode = permission_mode
-
-                # Handle session continuity
-                if continue_session:
-                    options.continue_session = True
-                elif session_id:
-                    options.resume = session_id
-
-                # Run the query and yield messages
-                async for message in query(prompt=prompt, options=options):
-                    # Debug logging
-                    logger.debug(f"Raw SDK message type: {type(message)}")
-                    logger.debug(f"Raw SDK message: {message}")
-
-                    # Convert message object to dict if needed
-                    if hasattr(message, "__dict__") and not isinstance(message, dict):
-                        # Convert object to dict for consistent handling
-                        message_dict = {}
-
-                        # Get all attributes from the object
-                        for attr_name in dir(message):
-                            if not attr_name.startswith("_"):  # Skip private attributes
-                                try:
-                                    attr_value = getattr(message, attr_name)
-                                    if not callable(attr_value):  # Skip methods
-                                        message_dict[attr_name] = attr_value
-                                except:
-                                    pass
-
-                        logger.debug(f"Converted message dict: {message_dict}")
-                        yield message_dict
-                    else:
-                        yield message
-
-            finally:
-                # Restore original environment (if we changed anything)
-                if original_env:
-                    for key, original_value in original_env.items():
-                        if original_value is None:
-                            os.environ.pop(key, None)
-                        else:
-                            os.environ[key] = original_value
+                    async for msg in self._run_via_query(
+                        prompt, system_prompt, model, stream, max_turns,
+                        allowed_tools, disallowed_tools, session_id,
+                        continue_session, permission_mode,
+                    ):
+                        yield msg
 
         except Exception as e:
             logger.error(f"Claude Agent SDK error: {e}")
-            # Yield error message in the expected format
             yield {
                 "type": "result",
                 "subtype": "error_during_execution",
@@ -192,42 +235,121 @@ class ClaudeCodeCLI:
                 "error_message": str(e),
             }
 
-    def parse_claude_message(self, messages: List[Dict[str, Any]]) -> Optional[str]:
-        """Extract the assistant message from Claude Agent SDK messages.
+    async def _run_via_client(self, prompt: str) -> AsyncGenerator[Dict[str, Any], None]:
+        """Fast path: reuse persistent client with a fresh session_id per request."""
+        try:
+            client = await self._ensure_client()
+            self._client_request_count += 1
+            sid = uuid.uuid4().hex[:8]
+            await client.query(prompt, session_id=sid)
 
-        Prioritizes ResultMessage.result for multi-turn conversations,
-        falls back to last AssistantMessage content.
-        """
-        # First, check for ResultMessage with 'result' field (multi-turn completion)
+            deadline = time.monotonic() + self.timeout
+            async for message in client.receive_messages():
+                if time.monotonic() > deadline:
+                    logger.error(f"Timeout after {self.timeout}s waiting for SDK response")
+                    await self._reset_client()
+                    yield {
+                        "type": "result",
+                        "subtype": "error_during_execution",
+                        "is_error": True,
+                        "error_message": f"Request timed out after {self.timeout}s",
+                    }
+                    return
+                logger.debug(f"Raw SDK message type: {type(message)}")
+                yield _to_dict(message)
+                if type(message).__name__ == "ResultMessage":
+                    break
+
+        except Exception as e:
+            logger.warning(f"Persistent client error, resetting: {e}")
+            await self._reset_client()
+            yield {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "error_message": f"Persistent client error (will auto-recover on next request): {e}",
+            }
+
+    async def _run_via_query(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        stream: bool = True,
+        max_turns: int = 1,
+        allowed_tools: Optional[List[str]] = None,
+        disallowed_tools: Optional[List[str]] = None,
+        session_id: Optional[str] = None,
+        continue_session: bool = False,
+        permission_mode: Optional[str] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Slow path: stateless query() with full option flexibility."""
+        options = ClaudeAgentOptions(
+            max_turns=max_turns,
+            cwd=self.cwd,
+            include_partial_messages=stream,
+        )
+
+        if model:
+            options.model = model
+
+        if system_prompt:
+            options.system_prompt = {"type": "text", "text": system_prompt}
+        else:
+            options.system_prompt = {"type": "text", "text": _DEFAULT_SYSTEM_PROMPT}
+
+        if allowed_tools is not None:
+            options.allowed_tools = allowed_tools
+        if disallowed_tools is not None:
+            options.disallowed_tools = disallowed_tools
+
+        if permission_mode:
+            options.permission_mode = permission_mode
+
+        if continue_session:
+            options.continue_session = True
+        elif session_id:
+            options.resume = session_id
+
+        deadline = time.monotonic() + self.timeout
+        async for message in query(prompt=prompt, options=options):
+            if time.monotonic() > deadline:
+                logger.error(f"Timeout after {self.timeout}s in query()")
+                yield {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "error_message": f"Request timed out after {self.timeout}s",
+                }
+                return
+            logger.debug(f"Raw SDK message type: {type(message)}")
+            yield _to_dict(message)
+
+    def parse_claude_message(self, messages: List[Dict[str, Any]]) -> Optional[str]:
+        """Extract the assistant message from Claude Agent SDK messages."""
         for message in messages:
             if message.get("subtype") == "success" and "result" in message:
                 return message["result"]
 
-        # Collect all text from AssistantMessages (take the last one with text)
         last_text = None
         for message in messages:
-            # Look for AssistantMessage type (new SDK format)
             if "content" in message and isinstance(message["content"], list):
                 text_parts = []
                 for block in message["content"]:
-                    # Handle TextBlock objects
                     if hasattr(block, "text"):
                         text_parts.append(block.text)
                     elif isinstance(block, dict) and block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
                     elif isinstance(block, str):
                         text_parts.append(block)
-
                 if text_parts:
                     last_text = "\n".join(text_parts)
 
-            # Fallback: look for old format
             elif message.get("type") == "assistant" and "message" in message:
                 sdk_message = message["message"]
                 if isinstance(sdk_message, dict) and "content" in sdk_message:
                     content = sdk_message["content"]
                     if isinstance(content, list) and len(content) > 0:
-                        # Handle content blocks (Anthropic SDK format)
                         text_parts = []
                         for block in content:
                             if isinstance(block, dict) and block.get("type") == "text":
@@ -250,7 +372,6 @@ class ClaudeCodeCLI:
         }
 
         for message in messages:
-            # New SDK format - ResultMessage
             if message.get("subtype") == "success" and "total_cost_usd" in message:
                 metadata.update(
                     {
@@ -260,11 +381,9 @@ class ClaudeCodeCLI:
                         "session_id": message.get("session_id"),
                     }
                 )
-            # New SDK format - SystemMessage
             elif message.get("subtype") == "init" and "data" in message:
                 data = message["data"]
                 metadata.update({"session_id": data.get("session_id"), "model": data.get("model")})
-            # Old format fallback
             elif message.get("type") == "result":
                 metadata.update(
                     {
@@ -281,19 +400,25 @@ class ClaudeCodeCLI:
 
         return metadata
 
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Estimate token count with CJK awareness.
+
+        English: ~4 chars per token.  CJK: ~1.5 chars per token.
+        """
+        if not text:
+            return 1
+        cjk = sum(1 for c in text if "\u4e00" <= c <= "\u9fff"
+                   or "\u3400" <= c <= "\u4dbf" or "\uf900" <= c <= "\ufaff")
+        ascii_chars = len(text) - cjk
+        return max(1, int(cjk / 1.5 + ascii_chars / 4))
+
     def estimate_token_usage(
         self, prompt: str, completion: str, model: Optional[str] = None
     ) -> Dict[str, int]:
-        """
-        Estimate token usage based on character count.
-
-        Uses rough approximation: ~4 characters per token for English text.
-        This is approximate and may not match actual tokenization.
-        """
-        # Rough approximation: 1 token ≈ 4 characters
-        prompt_tokens = max(1, len(prompt) // 4)
-        completion_tokens = max(1, len(completion) // 4)
-
+        """Estimate token usage with CJK-aware heuristic."""
+        prompt_tokens = self._estimate_tokens(prompt)
+        completion_tokens = self._estimate_tokens(completion)
         return {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,

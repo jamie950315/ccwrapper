@@ -1,14 +1,14 @@
 # Claude Code OpenAI API Wrapper
 
-An OpenAI API-compatible wrapper for Claude Code, allowing you to use Claude Code with any OpenAI client library. **Now powered by the official Claude Agent SDK v0.1.18** with enhanced authentication and features.
+An OpenAI API-compatible wrapper for Claude Code, allowing you to use Claude Code with any OpenAI client library. **Powered by the official Claude Agent SDK** with persistent client reuse, real-time streaming, and memory-safe operation on constrained hardware.
 
 ## Version
 
-**Current Version:** 2.2.0
-- **Interactive Landing Page:** API explorer at root URL with live endpoint testing
-- **Anthropic Messages API:** Native `/v1/messages` endpoint alongside OpenAI format
-- **Explicit Auth Selection:** New `CLAUDE_AUTH_METHOD` env var for auth control
-- **Tool Execution Fix:** `enable_tools: true` now properly enables Claude Code tools
+**Current Version:** 2.3.0
+- **Claude 4.6 Models:** Default model updated to `claude-sonnet-4-6`
+- **Persistent SDK Client:** Reusable client avoids subprocess spawn per request
+- **Real-time Streaming:** Token-level `StreamEvent` deltas for instant feedback
+- **Memory Safety:** Hardened for constrained environments (Raspberry Pi, etc.)
 
 **Upgrading from v1.x?**
 1. Pull latest code: `git pull origin main`
@@ -22,7 +22,7 @@ An OpenAI API-compatible wrapper for Claude Code, allowing you to use Claude Cod
 ## Status
 
 🎉 **Production Ready** - All core features working and tested:
-- ✅ Chat completions endpoint with **official Claude Agent SDK v0.1.18**
+- ✅ Chat completions endpoint with **official Claude Agent SDK** (persistent client reuse)
 - ✅ **Anthropic Messages API** (`/v1/messages`) for native compatibility
 - ✅ Streaming and non-streaming responses
 - ✅ Full OpenAI SDK compatibility
@@ -48,12 +48,13 @@ An OpenAI API-compatible wrapper for Claude Code, allowing you to use Claude Cod
 - Automatic model validation and selection
 
 ### 🛠 **Claude Agent SDK Integration**
-- **Official Claude Agent SDK** integration (v0.1.18) 🆕
+- **Official Claude Agent SDK** integration (v0.1.18)
+- **Dual-path architecture** - Persistent client for fast requests; stateless query for complex ones
+- **Real-time streaming** - Token-level `StreamEvent` deltas for instant feedback
 - **Real-time cost tracking** - actual costs from SDK metadata
-- **Accurate token counting** - input/output tokens from SDK
+- **CJK-aware token estimation** - Accurate for multilingual content
 - **Session management** - proper session IDs and continuity
-- **Enhanced error handling** with detailed authentication diagnostics
-- **Modern SDK features** - Latest capabilities and improvements
+- **Automatic client recycling** - Prevents subprocess memory growth over long uptimes
 
 ### 🔐 **Multi-Provider Authentication**
 - **Automatic detection** of authentication method
@@ -66,6 +67,7 @@ An OpenAI API-compatible wrapper for Claude Code, allowing you to use Claude Cod
 - **System prompt support** via SDK options
 - **Optional tool usage** - Enable Claude Code tools (Read, Write, Bash, etc.) when needed
 - **Fast default mode** - Tools disabled by default for OpenAI API compatibility
+- **Memory-safe for constrained environments** - Semaphore-limited concurrency, buffer cleanup, session caps, deadline-based timeouts
 - **Development mode** with auto-reload (`uvicorn --reload`)
 - **Interactive API key protection** - Optional security with auto-generated tokens
 - **Comprehensive logging** and debugging capabilities
@@ -362,11 +364,14 @@ Run: `docker-compose up -d` | Stop: `docker-compose down`
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `PORT` | Server port | `8000` |
-| `MAX_TIMEOUT` | Request timeout (seconds) | `300` |
+| `MAX_TIMEOUT` | Request timeout (ms) | `600000` |
 | `CLAUDE_CWD` | Working directory | temp dir |
 | `CLAUDE_AUTH_METHOD` | Auth method: `cli`, `api_key`, `bedrock`, `vertex` | auto-detect |
+| `DEFAULT_MODEL` | Default Claude model | `claude-sonnet-4-6` |
 | `ANTHROPIC_API_KEY` | Direct API key | - |
 | `API_KEYS` | Comma-separated client API keys | - |
+| `MAX_CONCURRENT_QUERIES` | Max concurrent SDK queries | `2` |
+| `CLIENT_RECYCLE_REQUESTS` | Recycle persistent client after N requests | `200` |
 
 ### Management
 
@@ -393,7 +398,7 @@ curl http://localhost:8000/v1/models
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4-5-20250929",
+    "model": "claude-sonnet-4-6",
     "messages": [
       {"role": "user", "content": "What is 2 + 2?"}
     ]
@@ -404,7 +409,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-generated-api-key" \
   -d '{
-    "model": "claude-sonnet-4-5-20250929",
+    "model": "claude-sonnet-4-6",
     "messages": [
       {"role": "user", "content": "Write a Python hello world script"}
     ],
@@ -428,7 +433,7 @@ client = OpenAI(
 
 # Basic chat completion
 response = client.chat.completions.create(
-    model="claude-sonnet-4-5-20250929",
+    model="claude-sonnet-4-6",
     messages=[
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "What files are in the current directory?"}
@@ -440,7 +445,7 @@ print(response.choices[0].message.content)
 
 # Enable tools when you need them (e.g., to read files)
 response = client.chat.completions.create(
-    model="claude-sonnet-4-5-20250929",
+    model="claude-sonnet-4-6",
     messages=[
         {"role": "user", "content": "What files are in the current directory?"}
     ],
@@ -455,7 +460,7 @@ print(f"Tokens: {response.usage.total_tokens} ({response.usage.prompt_tokens} + 
 
 # Streaming
 stream = client.chat.completions.create(
-    model="claude-sonnet-4-5-20250929",
+    model="claude-sonnet-4-6",
     messages=[
         {"role": "user", "content": "Explain quantum computing"}
     ],
@@ -471,20 +476,23 @@ for chunk in stream:
 
 All Claude models through November 2025 are supported:
 
-### Claude 4.5 Family (Latest - Fall 2025)
-- **`claude-opus-4-5-20250929`** 🎯 Most Capable - Latest Opus with enhanced reasoning and capabilities
-- **`claude-sonnet-4-5-20250929`** ⭐ Recommended - Best coding model, superior reasoning and math
-- **`claude-haiku-4-5-20251001`** ⚡ Fast & Cheap - Similar performance to Sonnet 4 at 1/3 cost
+### Claude 4.6 Family (Latest)
+- **`claude-opus-4-6`** 🎯 Most Capable - Best for agents and complex coding tasks
+- **`claude-sonnet-4-6`** ⭐ Recommended (Default) - Best balance of speed and intelligence
 
-### Claude 4.1 & 4.0 Family
-- **`claude-opus-4-1-20250805`** - Upgraded Opus 4 with improved agentic tasks and reasoning
-- `claude-opus-4-20250514` - Original Opus 4 with extended thinking mode
-- `claude-sonnet-4-20250514` - Original Sonnet 4 with hybrid reasoning
+### Claude 4.5 Family (Legacy)
+- `claude-opus-4-5-20250929` - Previous generation Opus
+- `claude-sonnet-4-5-20250929` - Previous generation Sonnet
+- **`claude-haiku-4-5-20251001`** ⚡ Fast & Cheap - Near-frontier intelligence at lowest cost
+- `claude-haiku-4-5` - Alias for claude-haiku-4-5-20251001
 
-### Claude 3.x Family
-- `claude-3-7-sonnet-20250219` - Hybrid model with rapid/thoughtful response modes
-- `claude-3-5-sonnet-20241022` - Previous generation Sonnet
-- `claude-3-5-haiku-20241022` - Previous generation fast model
+### Claude 4.1 & 4.0 Family (Legacy)
+- `claude-opus-4-1-20250805` - Upgraded Opus 4 with improved agentic tasks
+- `claude-opus-4-20250514` - Original Opus 4
+- `claude-sonnet-4-20250514` - Original Sonnet 4
+
+### Claude 3.x Family (Not Supported)
+- Claude 3.x models are listed for reference but **not supported** by the Claude Agent SDK
 
 **Note:** The model parameter is passed to Claude Code via the SDK's model selection.
 
@@ -509,7 +517,7 @@ client = openai.OpenAI(
 
 # Start a conversation with session continuity
 response1 = client.chat.completions.create(
-    model="claude-sonnet-4-5-20250929",
+    model="claude-sonnet-4-6",
     messages=[
         {"role": "user", "content": "Hello! My name is Alice and I'm learning Python."}
     ],
@@ -518,7 +526,7 @@ response1 = client.chat.completions.create(
 
 # Continue the conversation - Claude remembers the context
 response2 = client.chat.completions.create(
-    model="claude-sonnet-4-5-20250929",
+    model="claude-sonnet-4-6",
     messages=[
         {"role": "user", "content": "What's my name and what am I learning?"}
     ],
@@ -534,7 +542,7 @@ response2 = client.chat.completions.create(
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4-5-20250929",
+    "model": "claude-sonnet-4-6",
     "messages": [{"role": "user", "content": "My favourite color is blue."}],
     "session_id": "my-session"
   }'
@@ -543,7 +551,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4-5-20250929",
+    "model": "claude-sonnet-4-6",
     "messages": [{"role": "user", "content": "What's my favourite color?"}],
     "session_id": "my-session"
   }'
@@ -572,9 +580,10 @@ curl -X DELETE http://localhost:8000/v1/sessions/my-session
 ### Session Features
 
 - **Automatic Expiration**: Sessions expire after 1 hour of inactivity
+- **Message Cap**: 200 messages per session to prevent unbounded memory growth
 - **Streaming Support**: Session continuity works with both streaming and non-streaming requests
 - **Memory Persistence**: Full conversation history is maintained within the session
-- **Efficient Storage**: Only active sessions are kept in memory
+- **Efficient Storage**: Only active sessions are kept in memory; expired sessions auto-cleaned every 5 minutes
 
 ### Examples
 
@@ -611,11 +620,20 @@ See `examples/session_continuity.py` for comprehensive Python examples and `exam
 - [ ] **Enhanced streaming** - better chunk handling
 - [ ] **MCP integration** - Model Context Protocol server support
 
-### ✅ **Recent Improvements (v2.2.0)**
-- **Interactive Landing Page**: API explorer with live endpoint testing
-- **Anthropic Messages API**: Native `/v1/messages` endpoint
-- **Explicit Auth Selection**: `CLAUDE_AUTH_METHOD` env var
-- **Tool Execution Fix**: `enable_tools: true` now works correctly
+### ✅ **Recent Improvements (v2.3.0)**
+- **Claude 4.6 model support**: Default model updated to `claude-sonnet-4-6`
+- **Persistent SDK client**: Reusable `ClaudeSDKClient` avoids subprocess spawn per request
+- **Real-time StreamEvent streaming**: Token-level deltas for instant response feedback
+- **Memory safety hardening**: Semaphore concurrency limits, buffer cleanup, session message caps, deadline-based timeouts, automatic client recycling
+- **CJK-aware token estimation**: Accurate for Chinese/Japanese/Korean content
+- **Auth race condition fix**: Env vars set once at init instead of per-request
+- **Graceful shutdown**: Persistent client disconnected and sessions cleared on exit
+
+### ✅ **v2.2.0 Features**
+- Interactive Landing Page with API explorer
+- Anthropic Messages API: Native `/v1/messages` endpoint
+- Explicit Auth Selection: `CLAUDE_AUTH_METHOD` env var
+- Tool Execution Fix: `enable_tools: true` now works correctly
 
 ### ✅ **v2.0.0 - v2.1.0 Features**
 - Claude Agent SDK v0.1.18 with bundled CLI
