@@ -92,9 +92,9 @@ class MessageAdapter:
         content = re.sub(r"\n\s*\n\s*\n", "\n\n", content)  # Multiple newlines to double
         content = content.strip()
 
-        # If content is now empty or only whitespace, provide a fallback
+        # Return empty string if content was fully stripped; callers handle this.
         if not content or content.isspace():
-            return "I understand you're testing the system. How can I help you today?"
+            return ""
 
         return content
 
@@ -112,8 +112,13 @@ class MessageAdapter:
 
     @staticmethod
     def estimate_tokens(text: str) -> int:
+        """Estimate token count with CJK awareness.
+
+        English: ~4 chars per token.  CJK: ~1.5 chars per token.
         """
-        Rough estimation of token count.
-        OpenAI's rule of thumb: ~4 characters per token for English text.
-        """
-        return len(text) // 4
+        if not text:
+            return 0
+        cjk = sum(1 for c in text if "\u4e00" <= c <= "\u9fff"
+                   or "\u3400" <= c <= "\u4dbf" or "\uf900" <= c <= "\ufaff")
+        ascii_chars = len(text) - cjk
+        return max(1, int(cjk / 1.5 + ascii_chars / 4))

@@ -254,9 +254,10 @@ class TestClaudeCodeCLIEstimateTokenUsage:
     def test_estimate_basic(self, cli_class):
         """Basic token estimation."""
         cli = MagicMock()
+        cli._estimate_tokens = cli_class._estimate_tokens
         cli.estimate_token_usage = cli_class.estimate_token_usage.__get__(cli, cli_class)
 
-        # 12 chars / 4 = 3 tokens, 16 chars / 4 = 4 tokens
+        # 12 chars / 4 = 3 tokens, 14 chars / 4 = 3 tokens
         result = cli.estimate_token_usage("Hello World!", "Response here!")
         assert result["prompt_tokens"] == 3
         assert result["completion_tokens"] == 3
@@ -265,6 +266,7 @@ class TestClaudeCodeCLIEstimateTokenUsage:
     def test_estimate_minimum_one_token(self, cli_class):
         """Minimum is 1 token."""
         cli = MagicMock()
+        cli._estimate_tokens = cli_class._estimate_tokens
         cli.estimate_token_usage = cli_class.estimate_token_usage.__get__(cli, cli_class)
 
         result = cli.estimate_token_usage("Hi", "X")
@@ -274,6 +276,7 @@ class TestClaudeCodeCLIEstimateTokenUsage:
     def test_estimate_long_text(self, cli_class):
         """Longer text estimation."""
         cli = MagicMock()
+        cli._estimate_tokens = cli_class._estimate_tokens
         cli.estimate_token_usage = cli_class.estimate_token_usage.__get__(cli, cli_class)
 
         prompt = "a" * 400  # 100 tokens
@@ -287,6 +290,7 @@ class TestClaudeCodeCLIEstimateTokenUsage:
     def test_estimate_empty_strings(self, cli_class):
         """Empty strings return minimum 1 token each."""
         cli = MagicMock()
+        cli._estimate_tokens = cli_class._estimate_tokens
         cli.estimate_token_usage = cli_class.estimate_token_usage.__get__(cli, cli_class)
 
         result = cli.estimate_token_usage("", "")
@@ -463,38 +467,47 @@ class TestClaudeCodeCLIVerifyCLI:
     @pytest.mark.asyncio
     async def test_verify_cli_success(self, cli_instance):
         """verify_cli returns True on successful SDK response."""
-        mock_message = {"type": "assistant", "content": [{"type": "text", "text": "Hello"}]}
+        AssistantMsg = type("AssistantMessage", (), {})
+        ResultMsg = type("ResultMessage", (), {})
 
-        async def mock_query(*args, **kwargs):
-            yield mock_message
+        mock_client = AsyncMock()
 
-        with patch("src.claude_cli.query", mock_query):
-            result = await cli_instance.verify_cli()
-            assert result is True
+        async def mock_receive():
+            yield AssistantMsg()
+            yield ResultMsg()
+
+        mock_client.receive_messages = mock_receive
+
+        cli_instance._ensure_client = AsyncMock(return_value=mock_client)
+
+        result = await cli_instance.verify_cli()
+        assert result is True
 
     @pytest.mark.asyncio
     async def test_verify_cli_no_messages(self, cli_instance):
-        """verify_cli returns False when no messages returned."""
+        """verify_cli returns False when no AssistantMessage/StreamEvent received."""
+        ResultMsg = type("ResultMessage", (), {})
 
-        async def mock_query(*args, **kwargs):
-            return
-            yield  # Make it a generator but yield nothing
+        mock_client = AsyncMock()
 
-        with patch("src.claude_cli.query", mock_query):
-            result = await cli_instance.verify_cli()
-            assert result is False
+        async def mock_receive():
+            yield ResultMsg()
+
+        mock_client.receive_messages = mock_receive
+
+        cli_instance._ensure_client = AsyncMock(return_value=mock_client)
+
+        result = await cli_instance.verify_cli()
+        assert result is False
 
     @pytest.mark.asyncio
     async def test_verify_cli_exception(self, cli_instance):
         """verify_cli returns False on exception."""
+        cli_instance._ensure_client = AsyncMock(side_effect=RuntimeError("SDK error"))
+        cli_instance._reset_client = AsyncMock()
 
-        async def mock_query(*args, **kwargs):
-            raise RuntimeError("SDK error")
-            yield  # Make it a generator
-
-        with patch("src.claude_cli.query", mock_query):
-            result = await cli_instance.verify_cli()
-            assert result is False
+        result = await cli_instance.verify_cli()
+        assert result is False
 
 
 class TestClaudeCodeCLIRunCompletion:
@@ -676,10 +689,11 @@ class TestClaudeCodeCLIRunCompletion:
             assert "SDK failed" in messages[0]["error_message"]
 
     @pytest.mark.asyncio
-    async def test_run_completion_restores_env_vars(self, cli_instance):
-        """run_completion restores environment variables after execution."""
-        # Set an env var that will be modified
-        original_key = os.environ.get("ANTHROPIC_API_KEY")
+    async def test_env_vars_set_persistently(self, cli_instance):
+        """Auth env vars are set once during init, not per-request."""
+        # cli_instance was created with claude_env_vars = {"ANTHROPIC_API_KEY": "test-key"}
+        # Env vars should already be set from __init__
+        assert os.environ.get("ANTHROPIC_API_KEY") == "test-key"
 
         mock_message = {"type": "assistant"}
 
@@ -690,14 +704,8 @@ class TestClaudeCodeCLIRunCompletion:
             async for _ in cli_instance.run_completion("Hello"):
                 pass
 
-        # Env should be restored
-        if original_key is None:
-            assert (
-                "ANTHROPIC_API_KEY" not in os.environ
-                or os.environ.get("ANTHROPIC_API_KEY") == original_key
-            )
-        else:
-            assert os.environ.get("ANTHROPIC_API_KEY") == original_key
+        # Env vars should still be set (not cleaned up per-request)
+        assert os.environ.get("ANTHROPIC_API_KEY") == "test-key"
 
 
 class TestClaudeCodeCLICleanupException:

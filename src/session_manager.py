@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from threading import Lock
@@ -14,29 +14,33 @@ logger = logging.getLogger(__name__)
 class Session:
     """Represents a conversation session with message history."""
 
+    MAX_MESSAGES = 200  # Hard cap to prevent unbounded memory growth
+
     session_id: str
     messages: List[Message] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    last_accessed: datetime = field(default_factory=datetime.utcnow)
-    expires_at: datetime = field(default_factory=lambda: datetime.utcnow() + timedelta(hours=1))
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    last_accessed: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    expires_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc) + timedelta(hours=1))
 
     def touch(self):
         """Update last accessed time and extend expiration."""
-        self.last_accessed = datetime.utcnow()
-        self.expires_at = datetime.utcnow() + timedelta(hours=1)
+        self.last_accessed = datetime.now(timezone.utc)
+        self.expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
 
     def add_messages(self, messages: List[Message]):
-        """Add new messages to the session."""
+        """Add new messages to the session, pruning oldest if over limit."""
         self.messages.extend(messages)
+        if len(self.messages) > self.MAX_MESSAGES:
+            self.messages = self.messages[-self.MAX_MESSAGES:]
         self.touch()
 
     def get_all_messages(self) -> List[Message]:
-        """Get all messages in the session."""
-        return self.messages
+        """Get all messages in the session (returns a copy)."""
+        return list(self.messages)
 
     def is_expired(self) -> bool:
         """Check if the session has expired."""
-        return datetime.utcnow() > self.expires_at
+        return datetime.now(timezone.utc) > self.expires_at
 
     def to_session_info(self) -> SessionInfo:
         """Convert to SessionInfo model."""
@@ -65,13 +69,15 @@ class SessionManager:
             return  # Already started
 
         async def cleanup_loop():
-            try:
-                while True:
+            while True:
+                try:
                     await asyncio.sleep(self.cleanup_interval_minutes * 60)
                     self._cleanup_expired_sessions()
-            except asyncio.CancelledError:
-                logger.info("Session cleanup task cancelled")
-                raise
+                except asyncio.CancelledError:
+                    logger.info("Session cleanup task cancelled")
+                    raise
+                except Exception as e:
+                    logger.error(f"Session cleanup error (will retry): {e}")
 
         try:
             loop = asyncio.get_running_loop()
