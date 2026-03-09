@@ -1,5 +1,6 @@
 import os
 import asyncio
+import signal
 import time
 import uuid
 import tempfile
@@ -70,12 +71,54 @@ class ClaudeCodeCLI:
             os.environ[key] = value
 
         # Persistent SDK client — one subprocess reused across all requests.
-        # Each request uses a unique session_id so they don't share context.
         self._client: Optional[ClaudeSDKClient] = None
         self._client_lock = asyncio.Lock()
         self._client_request_count = 0
         # Recycle the persistent client every N requests to prevent subprocess memory growth.
         self._client_max_requests = int(os.getenv("CLIENT_RECYCLE_REQUESTS", "200"))
+        # Flag: recycle client before next request for session isolation.
+        self._needs_recycle = False
+
+    def _get_client_pid(self) -> Optional[int]:
+        """Extract subprocess PID from the SDK client (best-effort)."""
+        try:
+            transport = getattr(self._client, "_transport", None)
+            if transport is None:
+                query = getattr(self._client, "_query", None)
+                if query:
+                    transport = getattr(query, "transport", None)
+            if transport:
+                proc = getattr(transport, "_process", None)
+                if proc and hasattr(proc, "pid"):
+                    return proc.pid
+        except Exception:
+            pass
+        return None
+
+    async def _kill_client(self):
+        """Disconnect client and ensure subprocess is dead.
+
+        The SDK's disconnect() chain has suppress(Exception) calls that can
+        silently fail to terminate the subprocess. We track the PID and
+        send SIGKILL as a fallback.
+        """
+        if self._client is None:
+            return
+        pid = self._get_client_pid()
+        try:
+            await self._client.disconnect()
+        except Exception:
+            pass
+        self._client = None
+        # Fallback: ensure subprocess is dead
+        if pid:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                logger.debug(f"SIGKILL sent to subprocess {pid}")
+            except ProcessLookupError:
+                pass  # Already dead — good
+            except Exception as e:
+                logger.debug(f"Failed to kill subprocess {pid}: {e}")
 
     async def _ensure_client(self) -> ClaudeSDKClient:
         """Get or create the persistent ClaudeSDKClient.
@@ -84,18 +127,16 @@ class ClaudeCodeCLI:
         prevent subprocess memory growth over long uptimes.
         """
         async with self._client_lock:
-            # Recycle if request count exceeded
-            if (self._client is not None
-                    and self._client_request_count >= self._client_max_requests):
-                logger.info(
-                    f"Recycling persistent client after {self._client_request_count} requests"
-                )
-                try:
-                    await self._client.disconnect()
-                except Exception:
-                    pass
-                self._client = None
+            # Recycle if flagged for session isolation or request count exceeded
+            if self._client is not None and (
+                self._needs_recycle
+                or self._client_request_count >= self._client_max_requests
+            ):
+                reason = "session isolation" if self._needs_recycle else f"{self._client_request_count} requests"
+                logger.info(f"Recycling persistent client ({reason})")
+                await self._kill_client()
                 self._client_request_count = 0
+                self._needs_recycle = False
 
             if self._client is None:
                 logger.info("Creating persistent ClaudeSDKClient...")
@@ -116,11 +157,7 @@ class ClaudeCodeCLI:
         """Reset client on error so next request creates a fresh one."""
         async with self._client_lock:
             if self._client is not None:
-                try:
-                    await self._client.disconnect()
-                except Exception:
-                    pass
-                self._client = None
+                await self._kill_client()
                 self._client_request_count = 0
                 logger.info("Persistent client reset")
 
@@ -131,22 +168,22 @@ class ClaudeCodeCLI:
 
     def _can_use_persistent_client(
         self,
-        system_prompt: Optional[str],
         max_turns: int,
         allowed_tools: Optional[List[str]],
         disallowed_tools: Optional[List[str]],
         permission_mode: Optional[str],
     ) -> bool:
-        """Check if request matches persistent client's fixed options.
+        """Check if request can use the persistent client (fast path).
 
-        The persistent client is configured with allowed_tools=[], max_turns=1,
-        and the default system prompt. We allow allowed_tools=None here because
-        main.py always passes [] explicitly for the default (no-tools) path;
-        None would only arrive from direct callers that didn't specify tools,
-        which is compatible with the client's empty-tools configuration.
+        The persistent client is configured with allowed_tools=[], max_turns=1.
+        Custom system prompts are supported by embedding them into the user
+        prompt (see _run_via_client), so they don't block the fast path.
+
+        We allow allowed_tools=None here because main.py always passes []
+        explicitly for the default (no-tools) path; None would only arrive
+        from direct callers that didn't specify tools, which is compatible
+        with the client's empty-tools configuration.
         """
-        if system_prompt is not None:
-            return False
         if max_turns != 1:
             return False
         if allowed_tools is not None and allowed_tools != []:
@@ -210,13 +247,12 @@ class ClaudeCodeCLI:
 
         try:
             use_persistent = self._can_use_persistent_client(
-                system_prompt, max_turns, allowed_tools, disallowed_tools,
-                permission_mode,
+                max_turns, allowed_tools, disallowed_tools, permission_mode,
             )
 
             async with _query_semaphore:
                 if use_persistent and not session_id and not continue_session:
-                    async for msg in self._run_via_client(prompt):
+                    async for msg in self._run_via_client(prompt, system_prompt):
                         yield msg
                 else:
                     async for msg in self._run_via_query(
@@ -235,12 +271,54 @@ class ClaudeCodeCLI:
                 "error_message": str(e),
             }
 
-    async def _run_via_client(self, prompt: str) -> AsyncGenerator[Dict[str, Any], None]:
-        """Fast path: reuse persistent client with a fresh session_id per request."""
+    def _get_project_dir(self) -> Path:
+        """Get Claude Code's project directory for the current workspace.
+
+        Claude Code stores session history in ~/.claude/projects/<encoded-cwd>/
+        where <encoded-cwd> is the cwd path with '/' replaced by '-'.
+        """
+        encoded = str(self.cwd).replace("/", "-")
+        return Path.home() / ".claude" / "projects" / encoded
+
+    def _cleanup_session_files(self):
+        """Remove session .jsonl files to prevent cross-session context leakage.
+
+        Claude Code persists conversation history as .jsonl files in the
+        project directory. Without cleanup, the subprocess may inject
+        previous conversation context into new sessions.
+        """
+        project_dir = self._get_project_dir()
+        if not project_dir.exists():
+            return
+        removed = 0
+        for f in project_dir.glob("*.jsonl"):
+            try:
+                f.unlink()
+                removed += 1
+            except Exception:
+                pass
+        if removed:
+            logger.debug(f"Cleaned up {removed} session file(s) from {project_dir}")
+
+    async def _run_via_client(
+        self, prompt: str, system_prompt: Optional[str] = None
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Fast path: reuse persistent client with a fresh session_id per request.
+
+        When a custom system_prompt is provided, it is embedded at the top of
+        the user prompt so the persistent client (which has a fixed system
+        prompt) can still honour per-request system instructions without
+        falling back to the slow query() path.
+        """
         try:
             client = await self._ensure_client()
             self._client_request_count += 1
             sid = uuid.uuid4().hex[:8]
+
+            # Embed system prompt into user prompt for the persistent client
+            if system_prompt and system_prompt != _DEFAULT_SYSTEM_PROMPT:
+                prompt = f"<system_instructions>\n{system_prompt}\n</system_instructions>\n\n{prompt}"
+
             await client.query(prompt, session_id=sid)
 
             deadline = time.monotonic() + self.timeout
@@ -258,6 +336,10 @@ class ClaudeCodeCLI:
                 logger.debug(f"Raw SDK message type: {type(message)}")
                 yield _to_dict(message)
                 if type(message).__name__ == "ResultMessage":
+                    self._cleanup_session_files()
+                    # Flag client for recycle on next request — the subprocess
+                    # retains in-memory context across session_ids.
+                    self._needs_recycle = True
                     break
 
         except Exception as e:
