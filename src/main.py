@@ -962,8 +962,18 @@ async def check_compatibility(request_body: ChatCompletionRequest):
 @app.get("/health")
 @rate_limit_endpoint("health")
 async def health_check(request: Request):
-    """Health check endpoint."""
-    return {"status": "healthy", "service": "claude-code-openai-wrapper"}
+    """Health check endpoint with actual SDK and auth status."""
+    sdk_ready = (
+        claude_cli._active_client is not None or bool(claude_cli._standby_clients)
+    )
+    auth_valid, _ = validate_claude_code_auth()
+    status = "healthy" if (sdk_ready and auth_valid) else "degraded"
+    return {
+        "status": status,
+        "service": "claude-code-openai-wrapper",
+        "sdk_ready": sdk_ready,
+        "auth_valid": auth_valid,
+    }
 
 
 @app.get("/version")
