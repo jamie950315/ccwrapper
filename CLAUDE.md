@@ -48,14 +48,14 @@ docker-compose up -d
 3. `message_adapter.py` converts OpenAI message format → Claude prompt format
 4. `session_manager.py` injects conversation history if `session_id` is present
 5. `claude_cli.py` calls Claude Agent SDK — dual-path architecture:
-   - **Fast path**: Double-buffered persistent `ClaudeSDKClient` with zero-latency swap (for simple requests: no tools, no sessions, max_turns=1)
+   - **Fast path**: Triple-buffered persistent `ClaudeSDKClient` with zero-latency swap (for simple requests: no tools, no sessions, max_turns=1). Up to 2 standby clients pre-warmed in background via cascade pattern.
    - **Slow path**: Stateless `query()` call (for requests needing custom tools, sessions, or multi-turn)
    - Concurrent requests: fast path is exclusive (one at a time); overflow goes to slow path automatically
 6. Response converted back to OpenAI format (streaming SSE or JSON)
 
 **Key modules:**
 - `auth.py` — Multi-provider auth (CLI, API key, Bedrock, Vertex). Auto-detects method or uses `CLAUDE_AUTH_METHOD` env var.
-- `claude_cli.py` — Dual-path SDK wrapper with double-buffered session isolation. Active client serves the current request; standby client is pre-created in the background so the next request swaps instantly (~0s) instead of waiting for subprocess startup (~3s). After each request the used client is killed (SIGKILL fallback for SDK disconnect bugs) and a fresh standby is prepared. Manages working directory, max_turns, tool config, deadline-based timeouts (`time.monotonic()`), and automatic client recycling after N requests (configurable via `CLIENT_RECYCLE_REQUESTS` env, default 200).
+- `claude_cli.py` — Dual-path SDK wrapper with triple-buffered session isolation. Active client serves the current request; up to 2 standby clients are pre-warmed in background via cascade pattern (each task creates ONE client then spawns the next, avoiding event-loop blocking). Swap is instant (~0s); if a standby is still warming when needed, the request waits via `asyncio.Event` instead of cold-starting a duplicate. After each request the used client is killed (SIGKILL fallback for SDK disconnect bugs). Manages working directory, max_turns, tool config, deadline-based timeouts (`time.monotonic()`), and automatic client recycling after N requests (configurable via `CLIENT_RECYCLE_REQUESTS` env, default 200). Standby pool size configurable via `MAX_STANDBY_CLIENTS` (default 2).
 - `message_adapter.py` — Bidirectional format conversion. Strips thinking blocks, handles `attempt_completion`, CJK-aware token estimation (~1.5 chars/token for CJK, ~4 chars/token for ASCII).
 - `session_manager.py` — In-memory conversation history with 1-hour TTL, background cleanup every 5 min, lock-based thread safety, 200-message cap per session.
 - `tool_manager.py` — Tool metadata and allow/deny lists. Tools disabled by default for speed; enabled per-request via `enable_tools` parameter.
@@ -73,6 +73,7 @@ All config via environment variables (see `.env.example`). Key ones:
 - `DEFAULT_MODEL` — Default model (default: `claude-sonnet-4-6`)
 - `MAX_CONCURRENT_QUERIES` — Concurrent SDK queries limit (default: 2)
 - `CLIENT_RECYCLE_REQUESTS` — Recycle persistent client after N requests (default: 200)
+- `MAX_STANDBY_CLIENTS` — Number of pre-warmed standby clients (default: 2)
 - `RATE_LIMIT_ENABLED` — Toggle rate limiting (default: true)
 
 ## Code Style
