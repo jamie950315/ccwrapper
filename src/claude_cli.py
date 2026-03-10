@@ -70,18 +70,22 @@ class ClaudeCodeCLI:
         for key, value in self.claude_env_vars.items():
             os.environ[key] = value
 
-        # Double-buffered persistent clients for session isolation.
-        # _active_client serves the current request; _standby_client is
-        # pre-created in the background so the next request can swap
-        # instantly (~0s) instead of waiting for subprocess startup (~3s).
+        # Triple-buffered persistent clients for session isolation.
+        # _active_client serves the current request; _standby_clients is a
+        # FIFO of pre-created clients (up to _max_standby). Each preparation
+        # creates ONE client and cascades to the next via asyncio.create_task,
+        # avoiding a while loop that blocks the event loop during long connect().
+        # Memory: (_max_standby + 1) × ~400MB steady state.
         self._active_client: Optional[ClaudeSDKClient] = None
-        self._standby_client: Optional[ClaudeSDKClient] = None
+        self._standby_clients: list[Optional[ClaudeSDKClient]] = []
+        self._max_standby = int(os.getenv("MAX_STANDBY_CLIENTS", "2"))
         self._client_lock = asyncio.Lock()
         self._client_in_use = False  # Exclusive: only one request uses persistent client
         self._client_request_count = 0
         self._client_max_requests = int(os.getenv("CLIENT_RECYCLE_REQUESTS", "200"))
         self._needs_recycle = False
         self._preparing_standby = False
+        self._standby_ready_event = asyncio.Event()
 
     def _client_opts(self) -> ClaudeAgentOptions:
         """Build standard options for a persistent client."""
@@ -131,38 +135,51 @@ class ClaudeCodeCLI:
             except Exception:
                 pass
 
-    async def _prepare_standby(self):
-        """Pre-create a standby client in the background.
+    async def _prepare_one_standby(self):
+        """Pre-create ONE standby client, then cascade if pipeline not full.
 
-        Called after each request so the next request can swap instantly.
-        Only one preparation runs at a time. Memory impact: briefly two
-        Claude subprocesses coexist (~800MB), acceptable on Pi5 8GB since
-        MAX_CONCURRENT_QUERIES=2 was already designed for that budget.
+        Uses cascade pattern (each task spawns the next) instead of a while
+        loop, so each connect() runs in its own task and yields properly to
+        the event loop between subprocess startups.
         """
         if self._preparing_standby:
             return
         self._preparing_standby = True
+        self._standby_ready_event.clear()
         try:
+            async with self._client_lock:
+                if len(self._standby_clients) >= self._max_standby:
+                    return
             client = ClaudeSDKClient(options=self._client_opts())
             await client.connect()
             async with self._client_lock:
-                # Kill any existing standby (shouldn't happen, but be safe)
-                if self._standby_client is not None:
-                    await self._kill_one_client(self._standby_client)
-                self._standby_client = client
-            logger.info("Standby client ready (double-buffer)")
+                if len(self._standby_clients) < self._max_standby:
+                    self._standby_clients.append(client)
+                    count = len(self._standby_clients)
+                    logger.info(f"Standby client ready ({count}/{self._max_standby})")
+                else:
+                    await self._kill_one_client(client)
+                    return
         except Exception as e:
             logger.warning(f"Standby client preparation failed: {e}")
+            return
         finally:
             self._preparing_standby = False
+            self._standby_ready_event.set()
+        # Cascade: if pipeline still needs more, spawn next preparation
+        async with self._client_lock:
+            needs_more = len(self._standby_clients) < self._max_standby
+        if needs_more:
+            asyncio.create_task(self._prepare_one_standby())
 
     async def _ensure_client(self) -> ClaudeSDKClient:
         """Get or create a persistent ClaudeSDKClient.
 
-        Double-buffer strategy:
-        1. If active client needs recycle → kill it, swap in standby (instant)
-        2. If no standby available → create synchronously (fallback, ~3s)
-        3. After request completes → background task prepares next standby
+        Triple-buffer strategy:
+        1. If active client needs recycle → kill it, pop from standby FIFO (instant)
+        2. If FIFO empty but standby being prepared → wait for it (avoids duplicate subprocess)
+        3. If truly nothing available → create synchronously (fallback, ~5s on Pi5)
+        4. After swap → cascade task refills FIFO immediately
         """
         async with self._client_lock:
             if self._active_client is not None and (
@@ -176,19 +193,42 @@ class ClaudeCodeCLI:
                 self._client_request_count = 0
                 self._needs_recycle = False
 
-                # Swap in standby if available (instant, no subprocess startup)
-                if self._standby_client is not None:
-                    self._active_client = self._standby_client
-                    self._standby_client = None
-                    logger.info("Swapped in standby client (zero-latency)")
+                # Pop first standby from FIFO (instant, no subprocess startup)
+                if self._standby_clients:
+                    self._active_client = self._standby_clients.pop(0)
+                    remaining = len(self._standby_clients)
+                    logger.info(
+                        f"Swapped in standby client (zero-latency, {remaining} remaining)"
+                    )
+                    # Refill immediately — overlaps with API call (~2s head start).
+                    # Safe with cascade pattern: each task creates ONE client and exits.
+                    if remaining < self._max_standby:
+                        asyncio.create_task(self._prepare_one_standby())
 
+        # Outside the lock: if no active client, wait for in-progress or create new
+        if self._active_client is None:
+            if self._preparing_standby:
+                # A standby is almost ready — wait instead of wasting ~4s + 400MB
+                logger.info("Waiting for in-progress standby...")
+                try:
+                    await asyncio.wait_for(self._standby_ready_event.wait(), timeout=8.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Standby wait timed out")
+                # Grab the freshly-prepared standby
+                async with self._client_lock:
+                    if self._standby_clients:
+                        self._active_client = self._standby_clients.pop(0)
+                        self._client_request_count = 0
+                        logger.info("Swapped in freshly-prepared standby (waited)")
+            # Final fallback: create synchronously
             if self._active_client is None:
-                logger.info("Creating persistent ClaudeSDKClient...")
-                self._active_client = ClaudeSDKClient(options=self._client_opts())
-                await self._active_client.connect()
-                self._client_request_count = 0
-                logger.info("Persistent ClaudeSDKClient connected (~400MB)")
-            return self._active_client
+                logger.info("Creating persistent ClaudeSDKClient (no standby available)...")
+                async with self._client_lock:
+                    self._active_client = ClaudeSDKClient(options=self._client_opts())
+                    await self._active_client.connect()
+                    self._client_request_count = 0
+                    logger.info("Persistent ClaudeSDKClient connected (~400MB)")
+        return self._active_client
 
     async def _reset_client(self):
         """Reset active client on error so next request creates a fresh one."""
@@ -203,9 +243,9 @@ class ClaudeCodeCLI:
         """Disconnect all clients on server shutdown."""
         await self._reset_client()
         async with self._client_lock:
-            if self._standby_client is not None:
-                await self._kill_one_client(self._standby_client)
-                self._standby_client = None
+            for client in self._standby_clients:
+                await self._kill_one_client(client)
+            self._standby_clients.clear()
         logger.info("ClaudeCodeCLI shutdown complete")
 
     def _can_use_persistent_client(
@@ -260,7 +300,7 @@ class ClaudeCodeCLI:
                 logger.info("✅ Claude Agent SDK verified successfully")
                 # Verification leaves context in subprocess; prepare standby
                 self._needs_recycle = True
-                asyncio.create_task(self._prepare_standby())
+                asyncio.create_task(self._prepare_one_standby())
                 return True
             else:
                 logger.warning("⚠️ Claude Agent SDK test returned no messages")
@@ -401,7 +441,7 @@ class ClaudeCodeCLI:
         finally:
             self._client_in_use = False
             if self._needs_recycle:
-                asyncio.create_task(self._prepare_standby())
+                asyncio.create_task(self._prepare_one_standby())
 
     async def _run_via_query(
         self,

@@ -394,7 +394,7 @@ async def generate_streaming_response(
     request: ChatCompletionRequest, request_id: str, claude_headers: Optional[Dict[str, Any]] = None
 ) -> AsyncGenerator[str, None]:
     """Generate SSE formatted streaming response."""
-    chunks_buffer: list = []
+    last_chunk: Optional[dict] = None  # Only keep last non-StreamEvent chunk (memory-safe)
     try:
         # Process messages with session management
         all_messages, actual_session_id = session_manager.process_messages(
@@ -459,11 +459,11 @@ async def generate_streaming_response(
             # --- Handle StreamEvent (token-level delta) for real-time streaming ---
             stream_event = chunk.get("event") if isinstance(chunk, dict) else None
 
-            # Only buffer non-StreamEvent messages (AssistantMessage, ResultMessage)
-            # needed by parse_claude_message later. StreamEvents are high-frequency
-            # token deltas that would waste memory if buffered.
+            # Only keep the latest non-StreamEvent message (AssistantMessage,
+            # ResultMessage) for parse_claude_message. Replaces prior chunk to
+            # avoid unbounded buffer growth on long responses.
             if stream_event is None:
-                chunks_buffer.append(chunk)
+                last_chunk = chunk
             if stream_event is not None:
                 event_type = stream_event.get("type", "") if isinstance(stream_event, dict) else ""
 
@@ -614,18 +614,17 @@ async def generate_streaming_response(
             )
             yield f"data: {fallback_chunk.model_dump_json()}\n\n"
 
-        # Extract assistant response from all chunks
+        # Extract assistant response from the last chunk
         assistant_content = None
-        if chunks_buffer:
-            assistant_content = claude_cli.parse_claude_message(chunks_buffer)
+        if last_chunk is not None:
+            assistant_content = claude_cli.parse_claude_message([last_chunk])
 
             # Store in session if applicable
             if actual_session_id and assistant_content:
                 assistant_message = Message(role="assistant", content=assistant_content)
                 session_manager.add_assistant_response(actual_session_id, assistant_message)
 
-        # Free buffer immediately — can be large for long responses
-        chunks_buffer.clear()
+        last_chunk = None  # Free reference
 
         # Prepare usage data if requested
         usage_data = None
@@ -654,8 +653,8 @@ async def generate_streaming_response(
         error_chunk = {"error": {"message": str(e), "type": "streaming_error"}}
         yield f"data: {json.dumps(error_chunk)}\n\n"
     finally:
-        # Ensure buffer is freed even on error/client disconnect
-        chunks_buffer.clear()
+        # Ensure reference is freed even on error/client disconnect
+        last_chunk = None
 
 
 @app.post("/v1/chat/completions")
