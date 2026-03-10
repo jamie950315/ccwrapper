@@ -70,21 +70,39 @@ class ClaudeCodeCLI:
         for key, value in self.claude_env_vars.items():
             os.environ[key] = value
 
-        # Persistent SDK client — one subprocess reused across all requests.
-        self._client: Optional[ClaudeSDKClient] = None
+        # Double-buffered persistent clients for session isolation.
+        # _active_client serves the current request; _standby_client is
+        # pre-created in the background so the next request can swap
+        # instantly (~0s) instead of waiting for subprocess startup (~3s).
+        self._active_client: Optional[ClaudeSDKClient] = None
+        self._standby_client: Optional[ClaudeSDKClient] = None
         self._client_lock = asyncio.Lock()
+        self._client_in_use = False  # Exclusive: only one request uses persistent client
         self._client_request_count = 0
-        # Recycle the persistent client every N requests to prevent subprocess memory growth.
         self._client_max_requests = int(os.getenv("CLIENT_RECYCLE_REQUESTS", "200"))
-        # Flag: recycle client before next request for session isolation.
         self._needs_recycle = False
+        self._preparing_standby = False
 
-    def _get_client_pid(self) -> Optional[int]:
-        """Extract subprocess PID from the SDK client (best-effort)."""
+    def _client_opts(self) -> ClaudeAgentOptions:
+        """Build standard options for a persistent client."""
+        return ClaudeAgentOptions(
+            max_turns=1,
+            cwd=self.cwd,
+            allowed_tools=[],
+            include_partial_messages=True,
+            system_prompt={"type": "text", "text": _DEFAULT_SYSTEM_PROMPT},
+            extra_args={"no-session-persistence": None},
+        )
+
+    @staticmethod
+    def _get_client_pid(client: Optional[ClaudeSDKClient]) -> Optional[int]:
+        """Extract subprocess PID from an SDK client (best-effort)."""
+        if client is None:
+            return None
         try:
-            transport = getattr(self._client, "_transport", None)
+            transport = getattr(client, "_transport", None)
             if transport is None:
-                query = getattr(self._client, "_query", None)
+                query = getattr(client, "_query", None)
                 if query:
                     transport = getattr(query, "transport", None)
             if transport:
@@ -95,75 +113,99 @@ class ClaudeCodeCLI:
             pass
         return None
 
-    async def _kill_client(self):
-        """Disconnect client and ensure subprocess is dead.
-
-        The SDK's disconnect() chain has suppress(Exception) calls that can
-        silently fail to terminate the subprocess. We track the PID and
-        send SIGKILL as a fallback.
-        """
-        if self._client is None:
+    async def _kill_one_client(self, client: Optional[ClaudeSDKClient]):
+        """Disconnect a client and ensure its subprocess is dead."""
+        if client is None:
             return
-        pid = self._get_client_pid()
+        pid = self._get_client_pid(client)
         try:
-            await self._client.disconnect()
+            await client.disconnect()
         except Exception:
             pass
-        self._client = None
-        # Fallback: ensure subprocess is dead
         if pid:
             try:
                 os.kill(pid, signal.SIGKILL)
                 logger.debug(f"SIGKILL sent to subprocess {pid}")
             except ProcessLookupError:
-                pass  # Already dead — good
-            except Exception as e:
-                logger.debug(f"Failed to kill subprocess {pid}: {e}")
+                pass
+            except Exception:
+                pass
+
+    async def _prepare_standby(self):
+        """Pre-create a standby client in the background.
+
+        Called after each request so the next request can swap instantly.
+        Only one preparation runs at a time. Memory impact: briefly two
+        Claude subprocesses coexist (~800MB), acceptable on Pi5 8GB since
+        MAX_CONCURRENT_QUERIES=2 was already designed for that budget.
+        """
+        if self._preparing_standby:
+            return
+        self._preparing_standby = True
+        try:
+            client = ClaudeSDKClient(options=self._client_opts())
+            await client.connect()
+            async with self._client_lock:
+                # Kill any existing standby (shouldn't happen, but be safe)
+                if self._standby_client is not None:
+                    await self._kill_one_client(self._standby_client)
+                self._standby_client = client
+            logger.info("Standby client ready (double-buffer)")
+        except Exception as e:
+            logger.warning(f"Standby client preparation failed: {e}")
+        finally:
+            self._preparing_standby = False
 
     async def _ensure_client(self) -> ClaudeSDKClient:
-        """Get or create the persistent ClaudeSDKClient.
+        """Get or create a persistent ClaudeSDKClient.
 
-        Automatically recycles the client after _client_max_requests to
-        prevent subprocess memory growth over long uptimes.
+        Double-buffer strategy:
+        1. If active client needs recycle → kill it, swap in standby (instant)
+        2. If no standby available → create synchronously (fallback, ~3s)
+        3. After request completes → background task prepares next standby
         """
         async with self._client_lock:
-            # Recycle if flagged for session isolation or request count exceeded
-            if self._client is not None and (
+            if self._active_client is not None and (
                 self._needs_recycle
                 or self._client_request_count >= self._client_max_requests
             ):
                 reason = "session isolation" if self._needs_recycle else f"{self._client_request_count} requests"
-                logger.info(f"Recycling persistent client ({reason})")
-                await self._kill_client()
+                logger.info(f"Recycling active client ({reason})")
+                await self._kill_one_client(self._active_client)
+                self._active_client = None
                 self._client_request_count = 0
                 self._needs_recycle = False
 
-            if self._client is None:
+                # Swap in standby if available (instant, no subprocess startup)
+                if self._standby_client is not None:
+                    self._active_client = self._standby_client
+                    self._standby_client = None
+                    logger.info("Swapped in standby client (zero-latency)")
+
+            if self._active_client is None:
                 logger.info("Creating persistent ClaudeSDKClient...")
-                opts = ClaudeAgentOptions(
-                    max_turns=1,
-                    cwd=self.cwd,
-                    allowed_tools=[],
-                    include_partial_messages=True,
-                    system_prompt={"type": "text", "text": _DEFAULT_SYSTEM_PROMPT},
-                )
-                self._client = ClaudeSDKClient(options=opts)
-                await self._client.connect()
+                self._active_client = ClaudeSDKClient(options=self._client_opts())
+                await self._active_client.connect()
                 self._client_request_count = 0
-                logger.info("✅ Persistent ClaudeSDKClient connected (~400MB, reused)")
-            return self._client
+                logger.info("Persistent ClaudeSDKClient connected (~400MB)")
+            return self._active_client
 
     async def _reset_client(self):
-        """Reset client on error so next request creates a fresh one."""
+        """Reset active client on error so next request creates a fresh one."""
         async with self._client_lock:
-            if self._client is not None:
-                await self._kill_client()
+            if self._active_client is not None:
+                await self._kill_one_client(self._active_client)
+                self._active_client = None
                 self._client_request_count = 0
-                logger.info("Persistent client reset")
+                logger.info("Active client reset")
 
     async def shutdown(self):
-        """Disconnect persistent client on server shutdown."""
+        """Disconnect all clients on server shutdown."""
         await self._reset_client()
+        async with self._client_lock:
+            if self._standby_client is not None:
+                await self._kill_one_client(self._standby_client)
+                self._standby_client = None
         logger.info("ClaudeCodeCLI shutdown complete")
 
     def _can_use_persistent_client(
@@ -216,6 +258,9 @@ class ClaudeCodeCLI:
 
             if got_response:
                 logger.info("✅ Claude Agent SDK verified successfully")
+                # Verification leaves context in subprocess; prepare standby
+                self._needs_recycle = True
+                asyncio.create_task(self._prepare_standby())
                 return True
             else:
                 logger.warning("⚠️ Claude Agent SDK test returned no messages")
@@ -251,7 +296,10 @@ class ClaudeCodeCLI:
             )
 
             async with _query_semaphore:
-                if use_persistent and not session_id and not continue_session:
+                # Persistent client is single-threaded; if already in use,
+                # fall back to slow path to avoid interleaved subprocess I/O.
+                if (use_persistent and not session_id and not continue_session
+                        and not self._client_in_use):
                     async for msg in self._run_via_client(prompt, system_prompt):
                         yield msg
                 else:
@@ -310,6 +358,7 @@ class ClaudeCodeCLI:
         prompt) can still honour per-request system instructions without
         falling back to the slow query() path.
         """
+        self._client_in_use = True
         try:
             client = await self._ensure_client()
             self._client_request_count += 1
@@ -337,8 +386,6 @@ class ClaudeCodeCLI:
                 yield _to_dict(message)
                 if type(message).__name__ == "ResultMessage":
                     self._cleanup_session_files()
-                    # Flag client for recycle on next request — the subprocess
-                    # retains in-memory context across session_ids.
                     self._needs_recycle = True
                     break
 
@@ -351,6 +398,10 @@ class ClaudeCodeCLI:
                 "is_error": True,
                 "error_message": f"Persistent client error (will auto-recover on next request): {e}",
             }
+        finally:
+            self._client_in_use = False
+            if self._needs_recycle:
+                asyncio.create_task(self._prepare_standby())
 
     async def _run_via_query(
         self,

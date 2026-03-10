@@ -48,13 +48,14 @@ docker-compose up -d
 3. `message_adapter.py` converts OpenAI message format → Claude prompt format
 4. `session_manager.py` injects conversation history if `session_id` is present
 5. `claude_cli.py` calls Claude Agent SDK — dual-path architecture:
-   - **Fast path**: Reuses persistent `ClaudeSDKClient` (for simple requests: no tools, no sessions, max_turns=1)
-   - **Slow path**: Stateless `query()` call (for requests needing custom tools, sessions, system prompts, etc.)
+   - **Fast path**: Double-buffered persistent `ClaudeSDKClient` with zero-latency swap (for simple requests: no tools, no sessions, max_turns=1)
+   - **Slow path**: Stateless `query()` call (for requests needing custom tools, sessions, or multi-turn)
+   - Concurrent requests: fast path is exclusive (one at a time); overflow goes to slow path automatically
 6. Response converted back to OpenAI format (streaming SSE or JSON)
 
 **Key modules:**
 - `auth.py` — Multi-provider auth (CLI, API key, Bedrock, Vertex). Auto-detects method or uses `CLAUDE_AUTH_METHOD` env var.
-- `claude_cli.py` — Dual-path SDK wrapper. Persistent `ClaudeSDKClient` for fast simple requests; stateless `query()` for complex ones. Manages working directory, max_turns, tool config, deadline-based timeouts (`time.monotonic()`), and automatic client recycling after N requests (configurable via `CLIENT_RECYCLE_REQUESTS` env, default 200).
+- `claude_cli.py` — Dual-path SDK wrapper with double-buffered session isolation. Active client serves the current request; standby client is pre-created in the background so the next request swaps instantly (~0s) instead of waiting for subprocess startup (~3s). After each request the used client is killed (SIGKILL fallback for SDK disconnect bugs) and a fresh standby is prepared. Manages working directory, max_turns, tool config, deadline-based timeouts (`time.monotonic()`), and automatic client recycling after N requests (configurable via `CLIENT_RECYCLE_REQUESTS` env, default 200).
 - `message_adapter.py` — Bidirectional format conversion. Strips thinking blocks, handles `attempt_completion`, CJK-aware token estimation (~1.5 chars/token for CJK, ~4 chars/token for ASCII).
 - `session_manager.py` — In-memory conversation history with 1-hour TTL, background cleanup every 5 min, lock-based thread safety, 200-message cap per session.
 - `tool_manager.py` — Tool metadata and allow/deny lists. Tools disabled by default for speed; enabled per-request via `enable_tools` parameter.
