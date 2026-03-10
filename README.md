@@ -9,7 +9,7 @@ Many tools — Open WebUI, Continue, Cursor, custom apps — speak the OpenAI `/
 ## Quick Start
 
 ```bash
-git clone git@github.com:jamie950315/ccwrapper.git
+git clone https://github.com/jamie950315/ccwrapper.git
 cd ccwrapper
 poetry install
 
@@ -96,6 +96,7 @@ Sessions expire after 1 hour of inactivity. Each session holds up to 200 message
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-ant-..." \  # only required if API_KEY is set in .env
   -d '{
     "model": "claude-sonnet-4-6",
     "messages": [{"role": "user", "content": "What is 2+2?"}]
