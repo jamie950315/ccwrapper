@@ -158,6 +158,7 @@ Copy `.env.example` to `.env` and edit as needed. All settings have sensible def
 | `MAX_TIMEOUT` | Request timeout (ms) | `600000` |
 | `MAX_CONCURRENT_QUERIES` | Concurrent SDK query limit | `2` |
 | `CLIENT_RECYCLE_REQUESTS` | Recycle persistent client after N requests | `200` |
+| `MAX_STANDBY_CLIENTS` | Number of pre-warmed standby clients | `2` |
 | `RATE_LIMIT_ENABLED` | Enable per-IP rate limiting | `true` |
 | `RATE_LIMIT_CHAT_PER_MINUTE` | Chat endpoint rate limit | `10` |
 | `CORS_ORIGINS` | Allowed CORS origins | `["*"]` |
@@ -210,13 +211,13 @@ FastAPI server (src/main.py)
   ▼
 claude_cli.py → Claude Agent SDK
   │
-  ├─ Fast path: double-buffered ClaudeSDKClient (zero-latency swap)
+  ├─ Fast path: triple-buffered ClaudeSDKClient (zero-latency swap, 2 standbys)
   └─ Slow path: stateless query() (tools, sessions, multi-turn)
 ```
 
 Key modules:
 
-- **`claude_cli.py`** — Dual-path SDK wrapper with double-buffered session isolation. Active client serves the request; standby is pre-created in background for instant swap on next request. SIGKILL fallback ensures subprocess cleanup. Exclusive access prevents concurrent I/O corruption.
+- **`claude_cli.py`** — Dual-path SDK wrapper with triple-buffered session isolation. Active client serves the request; up to 2 standby clients are pre-warmed in background via cascade pattern for instant swap. If a standby is mid-preparation when needed, the request waits via `asyncio.Event` rather than cold-starting a duplicate. SIGKILL fallback ensures subprocess cleanup. Exclusive access prevents concurrent I/O corruption.
 - **`message_adapter.py`** — Converts between OpenAI and Claude formats. Strips thinking blocks, extracts `attempt_completion` results, CJK-aware token estimation.
 - **`session_manager.py`** — In-memory session store. 1-hour TTL, 200-message cap, background cleanup, thread-safe.
 - **`auth.py`** — Multi-provider auth with auto-detection.
