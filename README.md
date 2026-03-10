@@ -209,13 +209,13 @@ FastAPI server (src/main.py)
   ▼
 claude_cli.py → Claude Agent SDK
   │
-  ├─ Fast path: persistent ClaudeSDKClient (no tools, single turn)
-  └─ Slow path: stateless query() (tools, sessions, custom prompts)
+  ├─ Fast path: double-buffered ClaudeSDKClient (zero-latency swap)
+  └─ Slow path: stateless query() (tools, sessions, multi-turn)
 ```
 
 Key modules:
 
-- **`claude_cli.py`** — Dual-path SDK wrapper. Persistent client for simple requests, stateless `query()` for complex ones. Handles timeouts, client recycling, concurrency limits.
+- **`claude_cli.py`** — Dual-path SDK wrapper with double-buffered session isolation. Active client serves the request; standby is pre-created in background for instant swap on next request. SIGKILL fallback ensures subprocess cleanup. Exclusive access prevents concurrent I/O corruption.
 - **`message_adapter.py`** — Converts between OpenAI and Claude formats. Strips thinking blocks, extracts `attempt_completion` results, CJK-aware token estimation.
 - **`session_manager.py`** — In-memory session store. 1-hour TTL, 200-message cap, background cleanup, thread-safe.
 - **`auth.py`** — Multi-provider auth with auto-detection.
