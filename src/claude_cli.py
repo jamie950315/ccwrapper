@@ -1,7 +1,6 @@
 import os
 import asyncio
 import signal
-import time
 import uuid
 import tempfile
 import atexit
@@ -80,7 +79,7 @@ class ClaudeCodeCLI:
         self._standby_clients: list[Optional[ClaudeSDKClient]] = []
         self._max_standby = int(os.getenv("MAX_STANDBY_CLIENTS", "2"))
         self._client_lock = asyncio.Lock()
-        self._client_in_use = False  # Exclusive: only one request uses persistent client
+        self._fast_path_lock = asyncio.Lock()  # Exclusive: only one request uses persistent client
         self._client_request_count = 0
         self._client_max_requests = int(os.getenv("CLIENT_RECYCLE_REQUESTS", "200"))
         self._needs_recycle = False
@@ -335,13 +334,35 @@ class ClaudeCodeCLI:
                 max_turns, allowed_tools, disallowed_tools, permission_mode,
             )
 
-            async with _query_semaphore:
-                # Persistent client is single-threaded; if already in use,
-                # fall back to slow path to avoid interleaved subprocess I/O.
-                if (use_persistent and not session_id and not continue_session
-                        and not self._client_in_use):
-                    async for msg in self._run_via_client(prompt, system_prompt):
-                        yield msg
+            # Backpressure: reject early instead of queueing indefinitely
+            try:
+                await asyncio.wait_for(_query_semaphore.acquire(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.warning("Semaphore acquire timed out (30s), server busy")
+                yield {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "error_message": "Server busy, please retry later",
+                }
+                return
+
+            try:
+                # Persistent client: use asyncio.Lock for exclusive access.
+                # If lock is already held, fall back to slow path immediately.
+                if (use_persistent and not session_id and not continue_session):
+                    if self._fast_path_lock.locked():
+                        # Another request owns the persistent client — slow path
+                        async for msg in self._run_via_query(
+                            prompt, system_prompt, model, stream, max_turns,
+                            allowed_tools, disallowed_tools, session_id,
+                            continue_session, permission_mode,
+                        ):
+                            yield msg
+                    else:
+                        async with self._fast_path_lock:
+                            async for msg in self._run_via_client(prompt, system_prompt):
+                                yield msg
                 else:
                     async for msg in self._run_via_query(
                         prompt, system_prompt, model, stream, max_turns,
@@ -349,6 +370,8 @@ class ClaudeCodeCLI:
                         continue_session, permission_mode,
                     ):
                         yield msg
+            finally:
+                _query_semaphore.release()
 
         except Exception as e:
             logger.error(f"Claude Agent SDK error: {e}")
@@ -397,8 +420,9 @@ class ClaudeCodeCLI:
         the user prompt so the persistent client (which has a fixed system
         prompt) can still honour per-request system instructions without
         falling back to the slow query() path.
+
+        Caller must hold self._fast_path_lock to ensure exclusive access.
         """
-        self._client_in_use = True
         try:
             client = await self._ensure_client()
             self._client_request_count += 1
@@ -410,25 +434,27 @@ class ClaudeCodeCLI:
 
             await client.query(prompt, session_id=sid)
 
-            deadline = time.monotonic() + self.timeout
-            async for message in client.receive_messages():
-                if time.monotonic() > deadline:
-                    logger.error(f"Timeout after {self.timeout}s waiting for SDK response")
-                    await self._reset_client()
-                    yield {
-                        "type": "result",
-                        "subtype": "error_during_execution",
-                        "is_error": True,
-                        "error_message": f"Request timed out after {self.timeout}s",
-                    }
-                    return
-                logger.debug(f"Raw SDK message type: {type(message)}")
-                yield _to_dict(message)
-                if type(message).__name__ == "ResultMessage":
-                    self._cleanup_session_files()
-                    self._needs_recycle = True
-                    break
+            # asyncio.timeout guards against subprocess hangs where
+            # receive_messages() never yields (deadline check inside the
+            # loop only fires between iterations).
+            async with asyncio.timeout(self.timeout):
+                async for message in client.receive_messages():
+                    logger.debug(f"Raw SDK message type: {type(message)}")
+                    yield _to_dict(message)
+                    if type(message).__name__ == "ResultMessage":
+                        self._cleanup_session_files()
+                        self._needs_recycle = True
+                        break
 
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout after {self.timeout}s waiting for SDK response")
+            await self._reset_client()
+            yield {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "error_message": f"Request timed out after {self.timeout}s",
+            }
         except Exception as e:
             logger.warning(f"Persistent client error, resetting: {e}")
             await self._reset_client()
@@ -439,7 +465,6 @@ class ClaudeCodeCLI:
                 "error_message": f"Persistent client error (will auto-recover on next request): {e}",
             }
         finally:
-            self._client_in_use = False
             if self._needs_recycle:
                 asyncio.create_task(self._prepare_one_standby())
 
@@ -484,19 +509,19 @@ class ClaudeCodeCLI:
         elif session_id:
             options.resume = session_id
 
-        deadline = time.monotonic() + self.timeout
-        async for message in query(prompt=prompt, options=options):
-            if time.monotonic() > deadline:
-                logger.error(f"Timeout after {self.timeout}s in query()")
-                yield {
-                    "type": "result",
-                    "subtype": "error_during_execution",
-                    "is_error": True,
-                    "error_message": f"Request timed out after {self.timeout}s",
-                }
-                return
-            logger.debug(f"Raw SDK message type: {type(message)}")
-            yield _to_dict(message)
+        try:
+            async with asyncio.timeout(self.timeout):
+                async for message in query(prompt=prompt, options=options):
+                    logger.debug(f"Raw SDK message type: {type(message)}")
+                    yield _to_dict(message)
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout after {self.timeout}s in query()")
+            yield {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "error_message": f"Request timed out after {self.timeout}s",
+            }
 
     def parse_claude_message(self, messages: List[Dict[str, Any]]) -> Optional[str]:
         """Extract the assistant message from Claude Agent SDK messages."""
@@ -573,25 +598,14 @@ class ClaudeCodeCLI:
 
         return metadata
 
-    @staticmethod
-    def _estimate_tokens(text: str) -> int:
-        """Estimate token count with CJK awareness.
-
-        English: ~4 chars per token.  CJK: ~1.5 chars per token.
-        """
-        if not text:
-            return 1
-        cjk = sum(1 for c in text if "\u4e00" <= c <= "\u9fff"
-                   or "\u3400" <= c <= "\u4dbf" or "\uf900" <= c <= "\ufaff")
-        ascii_chars = len(text) - cjk
-        return max(1, int(cjk / 1.5 + ascii_chars / 4))
-
     def estimate_token_usage(
         self, prompt: str, completion: str, model: Optional[str] = None
     ) -> Dict[str, int]:
         """Estimate token usage with CJK-aware heuristic."""
-        prompt_tokens = self._estimate_tokens(prompt)
-        completion_tokens = self._estimate_tokens(completion)
+        from src.message_adapter import MessageAdapter
+
+        prompt_tokens = MessageAdapter.estimate_tokens(prompt)
+        completion_tokens = MessageAdapter.estimate_tokens(completion)
         return {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,

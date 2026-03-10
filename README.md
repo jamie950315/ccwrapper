@@ -124,7 +124,7 @@ A native `/v1/messages` endpoint is also available for clients that speak the An
 | `GET` | `/v1/auth/status` | Authentication info |
 | `POST` | `/v1/compatibility` | OpenAI compatibility report |
 | `POST` | `/v1/debug/request` | Request inspection |
-| `GET` | `/health` | Health check |
+| `GET` | `/health` | Health check (reports SDK readiness + auth validity) |
 | `GET` | `/version` | Server version |
 | `GET` | `/` | Interactive API explorer |
 
@@ -217,7 +217,7 @@ claude_cli.py → Claude Agent SDK
 
 Key modules:
 
-- **`claude_cli.py`** — Dual-path SDK wrapper with triple-buffered session isolation. Active client serves the request; up to 2 standby clients are pre-warmed in background via cascade pattern for instant swap. If a standby is mid-preparation when needed, the request waits via `asyncio.Event` rather than cold-starting a duplicate. SIGKILL fallback ensures subprocess cleanup. Exclusive access prevents concurrent I/O corruption.
+- **`claude_cli.py`** — Dual-path SDK wrapper with triple-buffered session isolation. Active client serves the request; up to 2 standby clients are pre-warmed in background via cascade pattern for instant swap. If a standby is mid-preparation when needed, the request waits via `asyncio.Event` rather than cold-starting a duplicate. SIGKILL fallback ensures subprocess cleanup. `asyncio.Lock` enforces exclusive fast-path access; `asyncio.timeout()` guards against subprocess hangs; 30s backpressure on semaphore rejects overload early.
 - **`message_adapter.py`** — Converts between OpenAI and Claude formats. Strips thinking blocks, extracts `attempt_completion` results, CJK-aware token estimation.
 - **`session_manager.py`** — In-memory session store. 1-hour TTL, 200-message cap, background cleanup, thread-safe.
 - **`auth.py`** — Multi-provider auth with auto-detection.

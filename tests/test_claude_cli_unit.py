@@ -252,9 +252,8 @@ class TestClaudeCodeCLIEstimateTokenUsage:
         return ClaudeCodeCLI
 
     def test_estimate_basic(self, cli_class):
-        """Basic token estimation."""
+        """Basic token estimation (delegates to MessageAdapter.estimate_tokens)."""
         cli = MagicMock()
-        cli._estimate_tokens = cli_class._estimate_tokens
         cli.estimate_token_usage = cli_class.estimate_token_usage.__get__(cli, cli_class)
 
         # 12 chars / 4 = 3 tokens, 14 chars / 4 = 3 tokens
@@ -264,9 +263,8 @@ class TestClaudeCodeCLIEstimateTokenUsage:
         assert result["total_tokens"] == 6
 
     def test_estimate_minimum_one_token(self, cli_class):
-        """Minimum is 1 token."""
+        """Minimum is 1 token for non-empty strings."""
         cli = MagicMock()
-        cli._estimate_tokens = cli_class._estimate_tokens
         cli.estimate_token_usage = cli_class.estimate_token_usage.__get__(cli, cli_class)
 
         result = cli.estimate_token_usage("Hi", "X")
@@ -276,7 +274,6 @@ class TestClaudeCodeCLIEstimateTokenUsage:
     def test_estimate_long_text(self, cli_class):
         """Longer text estimation."""
         cli = MagicMock()
-        cli._estimate_tokens = cli_class._estimate_tokens
         cli.estimate_token_usage = cli_class.estimate_token_usage.__get__(cli, cli_class)
 
         prompt = "a" * 400  # 100 tokens
@@ -288,14 +285,13 @@ class TestClaudeCodeCLIEstimateTokenUsage:
         assert result["total_tokens"] == 150
 
     def test_estimate_empty_strings(self, cli_class):
-        """Empty strings return minimum 1 token each."""
+        """Empty strings return 0 tokens."""
         cli = MagicMock()
-        cli._estimate_tokens = cli_class._estimate_tokens
         cli.estimate_token_usage = cli_class.estimate_token_usage.__get__(cli, cli_class)
 
         result = cli.estimate_token_usage("", "")
-        assert result["prompt_tokens"] == 1
-        assert result["completion_tokens"] == 1
+        assert result["prompt_tokens"] == 0
+        assert result["completion_tokens"] == 0
 
 
 class TestClaudeCodeCLICleanupTempDir:
