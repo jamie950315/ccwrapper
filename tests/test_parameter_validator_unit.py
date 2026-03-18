@@ -318,15 +318,15 @@ class TestCompatibilityReporter:
         report = CompatibilityReporter.generate_compatibility_report(request)
         assert "max_tokens" in report["unsupported_parameters"]
 
-    def test_stop_sequences_unsupported(self):
-        """stop sequences are flagged as unsupported."""
+    def test_stop_sequences_supported(self):
+        """stop sequences are flagged as supported (via post-processing)."""
         request = ChatCompletionRequest(
             model="claude-sonnet-4-5-20250929",
             messages=[Message(role="user", content="Hello")],
             stop=["END"],
         )
         report = CompatibilityReporter.generate_compatibility_report(request)
-        assert "stop" in report["unsupported_parameters"]
+        assert any("stop" in p for p in report["supported_parameters"])
 
     def test_penalties_unsupported(self):
         """presence_penalty and frequency_penalty are flagged as unsupported."""

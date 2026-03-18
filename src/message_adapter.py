@@ -20,9 +20,11 @@ class MessageAdapter:
                 # Use the last system message as the system prompt
                 system_prompt = message.content
             elif message.role == "user":
-                conversation_parts.append(f"Human: {message.content}")
+                prefix = f"[{message.name}] " if message.name else ""
+                conversation_parts.append(f"Human: {prefix}{message.content}")
             elif message.role == "assistant":
-                conversation_parts.append(f"Assistant: {message.content}")
+                prefix = f"[{message.name}] " if message.name else ""
+                conversation_parts.append(f"Assistant: {prefix}{message.content}")
 
         # Join conversation parts
         prompt = "\n\n".join(conversation_parts)
@@ -118,7 +120,114 @@ class MessageAdapter:
         """
         if not text:
             return 0
-        cjk = sum(1 for c in text if "\u4e00" <= c <= "\u9fff"
-                   or "\u3400" <= c <= "\u4dbf" or "\uf900" <= c <= "\ufaff")
+        cjk = sum(
+            1
+            for c in text
+            if "\u4e00" <= c <= "\u9fff" or "\u3400" <= c <= "\u4dbf" or "\uf900" <= c <= "\ufaff"
+        )
         ascii_chars = len(text) - cjk
         return max(1, int(cjk / 1.5 + ascii_chars / 4))
+
+    @staticmethod
+    def clean_json_response(content: str) -> str:
+        """Strip markdown code fences from JSON responses."""
+        content = content.strip()
+        if content.startswith("```json"):
+            content = content[7:]
+        elif content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        return content.strip()
+
+
+class StopSequenceProcessor:
+    """Post-processes streaming/non-streaming output to apply stop sequences.
+
+    For streaming: call process_delta() per chunk, flush() at end.
+    Uses a hold-back buffer of (max_stop_len - 1) chars to catch
+    stop sequences that span chunk boundaries.
+
+    For non-streaming: use the static truncate() method.
+    """
+
+    def __init__(self, stop_sequences: List[str]):
+        self.stop_sequences = [s for s in stop_sequences if s]
+        self._holdback_size = max((len(s) for s in self.stop_sequences), default=0)
+        if self._holdback_size > 0:
+            self._holdback_size -= 1
+        self._buffer = ""
+        self._stopped = False
+
+    @property
+    def stopped(self) -> bool:
+        return self._stopped
+
+    def process_delta(self, text: str) -> str:
+        """Process a streaming text delta.
+
+        Returns text safe to emit. May return "" if buffering.
+        Check .stopped after calling to see if a stop sequence was hit.
+        """
+        if self._stopped or not self.stop_sequences:
+            return "" if self._stopped else text
+
+        self._buffer += text
+
+        # Find the earliest stop sequence occurrence in the buffer
+        earliest_idx = -1
+        for seq in self.stop_sequences:
+            idx = self._buffer.find(seq)
+            if idx != -1 and (earliest_idx == -1 or idx < earliest_idx):
+                earliest_idx = idx
+        if earliest_idx != -1:
+            self._stopped = True
+            emit = self._buffer[:earliest_idx]
+            self._buffer = ""
+            return emit
+
+        # No stop found — emit the safe portion (before holdback window)
+        if len(self._buffer) > self._holdback_size:
+            if self._holdback_size > 0:
+                emit = self._buffer[: -self._holdback_size]
+                self._buffer = self._buffer[-self._holdback_size :]
+            else:
+                emit = self._buffer
+                self._buffer = ""
+            return emit
+
+        return ""  # Everything held back
+
+    def flush(self) -> str:
+        """Flush remaining buffer at end of stream. Check .stopped after."""
+        if self._stopped:
+            return ""
+        remaining = self._buffer
+        self._buffer = ""
+        for seq in self.stop_sequences:
+            idx = remaining.find(seq)
+            if idx != -1:
+                self._stopped = True
+                return remaining[:idx]
+        return remaining
+
+    @staticmethod
+    def truncate(content: str, stop_sequences: List[str]) -> tuple:
+        """Truncate content at first stop sequence (non-streaming).
+
+        Returns (truncated_content, was_truncated).
+        """
+        if not stop_sequences:
+            return content, False
+        earliest_idx = len(content)
+        found = False
+        for seq in stop_sequences:
+            if not seq:
+                continue
+            idx = content.find(seq)
+            if idx != -1 and idx < earliest_idx:
+                earliest_idx = idx
+                found = True
+        if found:
+            return content[:earliest_idx], True
+        return content, False

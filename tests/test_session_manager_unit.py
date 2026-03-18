@@ -101,7 +101,9 @@ class TestSession:
 
     def test_is_expired_true_for_past_expiry(self):
         """Session with past expiry is expired."""
-        session = Session(session_id="test-123", expires_at=datetime.now(timezone.utc) - timedelta(hours=1))
+        session = Session(
+            session_id="test-123", expires_at=datetime.now(timezone.utc) - timedelta(hours=1)
+        )
         assert session.is_expired() is True
 
     def test_to_session_info_returns_correct_model(self):

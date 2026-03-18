@@ -2,6 +2,7 @@
 Parameter validation and mapping utilities for OpenAI to Claude Code SDK conversion.
 """
 
+import json
 import logging
 from typing import Dict, Any, List, Optional
 from src.models import ChatCompletionRequest
@@ -141,6 +142,51 @@ class ParameterValidator:
 
         return claude_options
 
+    @classmethod
+    def extract_extra_sdk_headers(cls, headers: Dict[str, str]) -> Dict[str, Any]:
+        """Extract additional Claude SDK options from custom HTTP headers.
+
+        These map directly to ClaudeAgentOptions fields that the wrapper
+        previously did not expose:
+        - X-Claude-Beta: comma-separated beta flags (e.g. "context-1m-2025-08-07")
+        - X-Claude-Fork-Session: "true" to fork instead of reuse session
+        - X-Claude-Env: JSON object of env vars to pass to SDK subprocess
+        - X-Claude-Cwd: per-request working directory override
+        - X-Claude-Max-Budget-Usd: spending cap for this request
+        - X-Claude-Fallback-Model: model to use if primary is unavailable
+        """
+        extra: Dict[str, Any] = {}
+
+        if "x-claude-beta" in headers:
+            extra["betas"] = [b.strip() for b in headers["x-claude-beta"].split(",") if b.strip()]
+
+        if "x-claude-fork-session" in headers:
+            extra["fork_session"] = headers["x-claude-fork-session"].lower() in ("true", "1", "yes")
+
+        if "x-claude-env" in headers:
+            try:
+                env = json.loads(headers["x-claude-env"])
+                if isinstance(env, dict):
+                    extra["env"] = env
+                else:
+                    logger.warning("X-Claude-Env must be a JSON object")
+            except json.JSONDecodeError:
+                logger.warning("Invalid X-Claude-Env header (expected JSON object)")
+
+        if "x-claude-cwd" in headers:
+            extra["cwd"] = headers["x-claude-cwd"]
+
+        if "x-claude-max-budget-usd" in headers:
+            try:
+                extra["max_budget_usd"] = float(headers["x-claude-max-budget-usd"])
+            except ValueError:
+                logger.warning("Invalid X-Claude-Max-Budget-Usd header")
+
+        if "x-claude-fallback-model" in headers:
+            extra["fallback_model"] = headers["x-claude-fallback-model"]
+
+        return extra
+
 
 class CompatibilityReporter:
     """Reports on OpenAI API compatibility and suggests alternatives."""
@@ -191,10 +237,7 @@ class CompatibilityReporter:
             )
 
         if request.stop:
-            report["unsupported_parameters"].append("stop")
-            report["suggestions"].append(
-                "Stop sequences are not supported. Consider post-processing responses or using max_turns to limit output."
-            )
+            report["supported_parameters"].append("stop (via post-processing truncation)")
 
         if request.presence_penalty != 0 or request.frequency_penalty != 0:
             report["unsupported_parameters"].extend(["presence_penalty", "frequency_penalty"])

@@ -20,7 +20,9 @@ class Session:
     messages: List[Message] = field(default_factory=list)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_accessed: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    expires_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc) + timedelta(hours=1))
+    expires_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc) + timedelta(hours=1)
+    )
 
     def touch(self):
         """Update last accessed time and extend expiration."""
@@ -31,7 +33,7 @@ class Session:
         """Add new messages to the session, pruning oldest if over limit."""
         self.messages.extend(messages)
         if len(self.messages) > self.MAX_MESSAGES:
-            self.messages = self.messages[-self.MAX_MESSAGES:]
+            self.messages = self.messages[-self.MAX_MESSAGES :]
         self.touch()
 
     def get_all_messages(self) -> List[Message]:
