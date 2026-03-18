@@ -97,6 +97,55 @@ DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-sonnet-4-6")
 # Fast model (for speed/cost optimization)
 FAST_MODEL = "claude-haiku-4-5-20251001"
 
+# Model Alias Mapping: OpenAI / other model names → Claude equivalents
+# Enables drop-in compatibility: clients can send gpt-4o and it maps to Claude
+MODEL_ALIASES = {
+    # OpenAI GPT-4o family → Sonnet (balanced)
+    "gpt-4o": "claude-sonnet-4-6",
+    "gpt-4o-2024-05-13": "claude-sonnet-4-6",
+    "gpt-4o-2024-08-06": "claude-sonnet-4-6",
+    "gpt-4o-2024-11-20": "claude-sonnet-4-6",
+    "chatgpt-4o-latest": "claude-sonnet-4-6",
+    # OpenAI GPT-4o-mini → Haiku (fast/cheap)
+    "gpt-4o-mini": "claude-haiku-4-5",
+    "gpt-4o-mini-2024-07-18": "claude-haiku-4-5",
+    # OpenAI GPT-4 family → Opus (premium)
+    "gpt-4": "claude-opus-4-6",
+    "gpt-4-0613": "claude-opus-4-6",
+    "gpt-4-turbo": "claude-sonnet-4-6",
+    "gpt-4-turbo-preview": "claude-sonnet-4-6",
+    "gpt-4-turbo-2024-04-09": "claude-sonnet-4-6",
+    # OpenAI GPT-4.1 family (2025)
+    "gpt-4.1": "claude-sonnet-4-6",
+    "gpt-4.1-2025-04-14": "claude-sonnet-4-6",
+    "gpt-4.1-mini": "claude-haiku-4-5",
+    "gpt-4.1-mini-2025-04-14": "claude-haiku-4-5",
+    "gpt-4.1-nano": "claude-haiku-4-5",
+    "gpt-4.1-nano-2025-04-14": "claude-haiku-4-5",
+    # OpenAI GPT-3.5 → Haiku (fast/cheap)
+    "gpt-3.5-turbo": "claude-haiku-4-5",
+    "gpt-3.5-turbo-16k": "claude-haiku-4-5",
+    "gpt-3.5-turbo-0125": "claude-haiku-4-5",
+    # OpenAI reasoning models
+    "o1": "claude-opus-4-6",
+    "o1-2024-12-17": "claude-opus-4-6",
+    "o1-preview": "claude-opus-4-6",
+    "o1-preview-2024-09-12": "claude-opus-4-6",
+    "o1-mini": "claude-sonnet-4-6",
+    "o1-mini-2024-09-12": "claude-sonnet-4-6",
+    "o3": "claude-opus-4-6",
+    "o3-mini": "claude-sonnet-4-6",
+    "o4-mini": "claude-sonnet-4-6",
+    # Google Gemini (some clients send these)
+    "gemini-pro": "claude-sonnet-4-6",
+    "gemini-1.5-pro": "claude-sonnet-4-6",
+    "gemini-1.5-flash": "claude-haiku-4-5",
+    "gemini-2.0-flash": "claude-haiku-4-5",
+    # DeepSeek
+    "deepseek-chat": "claude-sonnet-4-6",
+    "deepseek-reasoner": "claude-opus-4-6",
+}
+
 # System Prompt Types
 SYSTEM_PROMPT_TYPE_TEXT = "text"
 SYSTEM_PROMPT_TYPE_PRESET = "preset"

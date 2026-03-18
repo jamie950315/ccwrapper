@@ -302,17 +302,13 @@ class TestStopSequenceProcessorTruncate:
 
     def test_truncate_at_stop_sequence(self):
         """Content is truncated at first stop sequence."""
-        content, was_truncated = StopSequenceProcessor.truncate(
-            "Hello world. End of text.", ["."]
-        )
+        content, was_truncated = StopSequenceProcessor.truncate("Hello world. End of text.", ["."])
         assert content == "Hello world"
         assert was_truncated is True
 
     def test_truncate_no_stop_found(self):
         """Content unchanged when no stop sequence found."""
-        content, was_truncated = StopSequenceProcessor.truncate(
-            "Hello world", ["END"]
-        )
+        content, was_truncated = StopSequenceProcessor.truncate("Hello world", ["END"])
         assert content == "Hello world"
         assert was_truncated is False
 
@@ -473,31 +469,23 @@ class TestExtractExtraSdkHeaders:
 
     def test_fork_session_true(self):
         """X-Claude-Fork-Session: true."""
-        result = ParameterValidator.extract_extra_sdk_headers(
-            {"x-claude-fork-session": "true"}
-        )
+        result = ParameterValidator.extract_extra_sdk_headers({"x-claude-fork-session": "true"})
         assert result["fork_session"] is True
 
     def test_fork_session_false(self):
         """X-Claude-Fork-Session: false."""
-        result = ParameterValidator.extract_extra_sdk_headers(
-            {"x-claude-fork-session": "false"}
-        )
+        result = ParameterValidator.extract_extra_sdk_headers({"x-claude-fork-session": "false"})
         assert result["fork_session"] is False
 
     def test_env_header_json_object(self):
         """X-Claude-Env accepts JSON object."""
         env = {"MY_VAR": "value", "OTHER": "123"}
-        result = ParameterValidator.extract_extra_sdk_headers(
-            {"x-claude-env": json.dumps(env)}
-        )
+        result = ParameterValidator.extract_extra_sdk_headers({"x-claude-env": json.dumps(env)})
         assert result["env"] == env
 
     def test_env_header_invalid_json_ignored(self):
         """X-Claude-Env with invalid JSON is ignored."""
-        result = ParameterValidator.extract_extra_sdk_headers(
-            {"x-claude-env": "not-json"}
-        )
+        result = ParameterValidator.extract_extra_sdk_headers({"x-claude-env": "not-json"})
         assert "env" not in result
 
     def test_env_header_non_object_ignored(self):
@@ -509,16 +497,12 @@ class TestExtractExtraSdkHeaders:
 
     def test_cwd_header(self):
         """X-Claude-Cwd is parsed."""
-        result = ParameterValidator.extract_extra_sdk_headers(
-            {"x-claude-cwd": "/tmp/workspace"}
-        )
+        result = ParameterValidator.extract_extra_sdk_headers({"x-claude-cwd": "/tmp/workspace"})
         assert result["cwd"] == "/tmp/workspace"
 
     def test_max_budget_usd_header(self):
         """X-Claude-Max-Budget-Usd is parsed as float."""
-        result = ParameterValidator.extract_extra_sdk_headers(
-            {"x-claude-max-budget-usd": "1.50"}
-        )
+        result = ParameterValidator.extract_extra_sdk_headers({"x-claude-max-budget-usd": "1.50"})
         assert result["max_budget_usd"] == 1.50
 
     def test_max_budget_usd_invalid_ignored(self):
@@ -811,3 +795,191 @@ class TestCompatibilityReporterStopUpdate:
         report = CompatibilityReporter.generate_compatibility_report(req)
         assert any("stop" in p for p in report["supported_parameters"])
         assert "stop" not in report["unsupported_parameters"]
+
+
+# ============================================================================
+# Stage 2: JsonFenceStripper, model aliasing, preset, cost, JSON validation
+# ============================================================================
+
+
+class TestJsonFenceStripper:
+    """Test JsonFenceStripper for streaming JSON mode."""
+
+    def test_strips_json_fence_across_chunks(self):
+        """```json fence is stripped from streaming output."""
+        from src.message_adapter import JsonFenceStripper
+
+        stripper = JsonFenceStripper()
+        parts = ['```json\n{"ke', 'y": "val', 'ue"}\n```']
+        out = ""
+        for p in parts:
+            out += stripper.process_delta(p)
+        out += stripper.flush()
+        assert out == '{"key": "value"}'
+
+    def test_strips_generic_fence(self):
+        """``` fence (without json) is stripped."""
+        from src.message_adapter import JsonFenceStripper
+
+        stripper = JsonFenceStripper()
+        out = stripper.process_delta('```\n{"a":1}\n```')
+        out += stripper.flush()
+        assert out == '{"a":1}'
+
+    def test_no_fence_passthrough(self):
+        """Content without fences passes through."""
+        from src.message_adapter import JsonFenceStripper
+
+        stripper = JsonFenceStripper()
+        out = ""
+        for chunk in ['{"key"', ': "value"}']:
+            out += stripper.process_delta(chunk)
+        out += stripper.flush()
+        assert out == '{"key": "value"}'
+
+    def test_small_chunks(self):
+        """Handles char-by-char streaming."""
+        from src.message_adapter import JsonFenceStripper
+
+        stripper = JsonFenceStripper()
+        text = '```json\n{"x":1}\n```'
+        out = ""
+        for ch in text:
+            out += stripper.process_delta(ch)
+        out += stripper.flush()
+        assert out == '{"x":1}'
+
+
+class TestModelAliasMapping:
+    """Test model name alias resolution."""
+
+    def test_gpt4o_maps_to_sonnet(self):
+        """gpt-4o maps to claude-sonnet-4-6."""
+        assert ParameterValidator.resolve_model_alias("gpt-4o") == "claude-sonnet-4-6"
+
+    def test_gpt4o_mini_maps_to_haiku(self):
+        """gpt-4o-mini maps to claude-haiku-4-5."""
+        assert ParameterValidator.resolve_model_alias("gpt-4o-mini") == "claude-haiku-4-5"
+
+    def test_gpt4_maps_to_opus(self):
+        """gpt-4 maps to claude-opus-4-6."""
+        assert ParameterValidator.resolve_model_alias("gpt-4") == "claude-opus-4-6"
+
+    def test_gpt35_maps_to_haiku(self):
+        """gpt-3.5-turbo maps to claude-haiku-4-5."""
+        assert ParameterValidator.resolve_model_alias("gpt-3.5-turbo") == "claude-haiku-4-5"
+
+    def test_o1_maps_to_opus(self):
+        """o1 maps to claude-opus-4-6."""
+        assert ParameterValidator.resolve_model_alias("o1") == "claude-opus-4-6"
+
+    def test_o3_mini_maps_to_sonnet(self):
+        """o3-mini maps to claude-sonnet-4-6."""
+        assert ParameterValidator.resolve_model_alias("o3-mini") == "claude-sonnet-4-6"
+
+    def test_gpt41_maps_to_sonnet(self):
+        """gpt-4.1 maps to claude-sonnet-4-6."""
+        assert ParameterValidator.resolve_model_alias("gpt-4.1") == "claude-sonnet-4-6"
+
+    def test_gpt41_mini_maps_to_haiku(self):
+        """gpt-4.1-mini maps to claude-haiku-4-5."""
+        assert ParameterValidator.resolve_model_alias("gpt-4.1-mini") == "claude-haiku-4-5"
+
+    def test_claude_model_unchanged(self):
+        """Native Claude model names pass through unchanged."""
+        assert ParameterValidator.resolve_model_alias("claude-sonnet-4-6") == "claude-sonnet-4-6"
+
+    def test_unknown_model_unchanged(self):
+        """Unknown model names pass through unchanged."""
+        assert ParameterValidator.resolve_model_alias("my-custom-model") == "my-custom-model"
+
+    def test_gemini_maps(self):
+        """Gemini models map to Claude equivalents."""
+        assert ParameterValidator.resolve_model_alias("gemini-1.5-pro") == "claude-sonnet-4-6"
+        assert ParameterValidator.resolve_model_alias("gemini-2.0-flash") == "claude-haiku-4-5"
+
+    def test_deepseek_maps(self):
+        """DeepSeek models map to Claude equivalents."""
+        assert ParameterValidator.resolve_model_alias("deepseek-chat") == "claude-sonnet-4-6"
+        assert ParameterValidator.resolve_model_alias("deepseek-reasoner") == "claude-opus-4-6"
+
+
+class TestSystemPromptPreset:
+    """Test system prompt preset via extra SDK headers."""
+
+    def test_preset_header_extracted(self):
+        """X-Claude-System-Prompt-Preset header is extracted."""
+        result = ParameterValidator.extract_extra_sdk_headers(
+            {"x-claude-system-prompt-preset": "claude_code"}
+        )
+        assert result["system_prompt_preset"] == "claude_code"
+
+
+class TestUsageCostExtension:
+    """Test Usage model cost extension fields."""
+
+    def test_usage_with_cost_data(self):
+        """Usage model accepts cost extension fields."""
+        from src.models import Usage
+
+        usage = Usage(
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+            total_cost_usd=0.005,
+            duration_ms=1234,
+            num_turns=2,
+        )
+        assert usage.total_cost_usd == 0.005
+        assert usage.duration_ms == 1234
+        assert usage.num_turns == 2
+
+    def test_usage_without_cost_data(self):
+        """Usage model works without cost fields (backward compatible)."""
+        from src.models import Usage
+
+        usage = Usage(prompt_tokens=100, completion_tokens=50, total_tokens=150)
+        assert usage.total_cost_usd is None
+        assert usage.duration_ms is None
+
+    def test_usage_serializes_cost_fields(self):
+        """Cost fields appear in serialized output."""
+        from src.models import Usage
+
+        usage = Usage(
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+            total_cost_usd=0.001,
+        )
+        data = usage.model_dump()
+        assert "total_cost_usd" in data
+        assert data["total_cost_usd"] == 0.001
+
+
+class TestCleanJsonResponseValidation:
+    """Test enhanced clean_json_response with validation."""
+
+    def test_extracts_json_from_text(self):
+        """Extracts JSON object embedded in text."""
+        raw = 'Here is the result: {"name": "Alice"} Hope this helps!'
+        result = MessageAdapter.clean_json_response(raw)
+        assert result == '{"name": "Alice"}'
+
+    def test_extracts_json_array_from_text(self):
+        """Extracts JSON array embedded in text."""
+        raw = "The list: [1, 2, 3] as requested."
+        result = MessageAdapter.clean_json_response(raw)
+        assert result == "[1, 2, 3]"
+
+    def test_valid_json_unchanged(self):
+        """Already valid JSON passes through."""
+        raw = '{"key": "value"}'
+        result = MessageAdapter.clean_json_response(raw)
+        assert result == raw
+
+    def test_code_fence_with_extra_text(self):
+        """Code fence stripped even with surrounding text."""
+        raw = '```json\n{"key": "value"}\n```'
+        result = MessageAdapter.clean_json_response(raw)
+        assert result == '{"key": "value"}'

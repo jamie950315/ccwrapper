@@ -90,41 +90,32 @@ class TestClaudeCodeAuthManagerDetectMethod:
 
     def test_legacy_bedrock_env_var(self):
         """CLAUDE_CODE_USE_BEDROCK=1 uses bedrock."""
-        env = {"CLAUDE_CODE_USE_BEDROCK": "1"}
-        # Remove CLAUDE_AUTH_METHOD if present
-        env_copy = {k: v for k, v in os.environ.items() if k != "CLAUDE_AUTH_METHOD"}
-        env_copy.update(env)
-        with patch.dict(os.environ, env_copy, clear=True):
-            import src.auth
+        with patch.dict(os.environ, {"CLAUDE_CODE_USE_BEDROCK": "1"}, clear=True):
+            with patch("dotenv.load_dotenv", return_value=None):
+                import src.auth
 
-            importlib.reload(src.auth)
-            assert src.auth.auth_manager.auth_method == "bedrock"
+                importlib.reload(src.auth)
+                assert src.auth.auth_manager.auth_method == "bedrock"
 
     def test_legacy_vertex_env_var(self):
         """CLAUDE_CODE_USE_VERTEX=1 uses vertex."""
-        env = {"CLAUDE_CODE_USE_VERTEX": "1"}
-        env_copy = {k: v for k, v in os.environ.items() if k != "CLAUDE_AUTH_METHOD"}
-        env_copy.update(env)
-        with patch.dict(os.environ, env_copy, clear=True):
-            import src.auth
+        with patch.dict(os.environ, {"CLAUDE_CODE_USE_VERTEX": "1"}, clear=True):
+            with patch("dotenv.load_dotenv", return_value=None):
+                import src.auth
 
-            importlib.reload(src.auth)
-            assert src.auth.auth_manager.auth_method == "vertex"
+                importlib.reload(src.auth)
+                assert src.auth.auth_manager.auth_method == "vertex"
 
     def test_auto_detect_anthropic_key(self):
         """ANTHROPIC_API_KEY auto-detects to anthropic."""
-        env = {"ANTHROPIC_API_KEY": "test-key-12345678901234567890"}
-        env_copy = {
-            k: v
-            for k, v in os.environ.items()
-            if k not in ["CLAUDE_AUTH_METHOD", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"]
-        }
-        env_copy.update(env)
-        with patch.dict(os.environ, env_copy, clear=True):
-            import src.auth
+        with patch.dict(
+            os.environ, {"ANTHROPIC_API_KEY": "test-key-12345678901234567890"}, clear=True
+        ):
+            with patch("dotenv.load_dotenv", return_value=None):
+                import src.auth
 
-            importlib.reload(src.auth)
-            assert src.auth.auth_manager.auth_method == "anthropic"
+                importlib.reload(src.auth)
+                assert src.auth.auth_manager.auth_method == "anthropic"
 
     def test_default_to_claude_cli(self):
         """No env vars defaults to claude_cli."""

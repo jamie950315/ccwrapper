@@ -24,13 +24,34 @@ class MessageAdapter:
                 conversation_parts.append(f"Human: {prefix}{message.content}")
             elif message.role == "assistant":
                 prefix = f"[{message.name}] " if message.name else ""
-                conversation_parts.append(f"Assistant: {prefix}{message.content}")
+                parts = []
+                if message.content:
+                    parts.append(f"{prefix}{message.content}")
+                # Include tool_calls as text for Claude's context
+                if hasattr(message, "tool_calls") and message.tool_calls:
+                    for tc in message.tool_calls:
+                        func = tc.function if hasattr(tc, "function") else tc.get("function", {})
+                        name = func.name if hasattr(func, "name") else func.get("name", "")
+                        args = (
+                            func.arguments
+                            if hasattr(func, "arguments")
+                            else func.get("arguments", "")
+                        )
+                        parts.append(f"[Called function: {name}({args})]")
+                conversation_parts.append(f"Assistant: {''.join(parts) if parts else ''}")
+            elif message.role == "tool":
+                # Tool result → user message for Claude
+                content = message.content or ""
+                label = (
+                    f"[Function result for {message.name}]" if message.name else "[Function result]"
+                )
+                conversation_parts.append(f"Human: {label}\n{content}")
 
         # Join conversation parts
         prompt = "\n\n".join(conversation_parts)
 
-        # If the last message wasn't from the user, add a prompt for assistant
-        if messages and messages[-1].role != "user":
+        # If the last message wasn't from the user or tool, add a prompt for assistant
+        if messages and messages[-1].role not in ("user", "tool"):
             prompt += "\n\nHuman: Please continue."
 
         return prompt, system_prompt
@@ -130,7 +151,7 @@ class MessageAdapter:
 
     @staticmethod
     def clean_json_response(content: str) -> str:
-        """Strip markdown code fences from JSON responses."""
+        """Strip markdown code fences from JSON responses and validate."""
         content = content.strip()
         if content.startswith("```json"):
             content = content[7:]
@@ -138,7 +159,95 @@ class MessageAdapter:
             content = content[3:]
         if content.endswith("```"):
             content = content[:-3]
-        return content.strip()
+        content = content.strip()
+
+        # Validate JSON; if invalid, try to extract JSON object/array
+        import json as _json
+
+        try:
+            _json.loads(content)
+        except (ValueError, TypeError):
+            # Try to find a JSON object or array in the text
+            for start_char, end_char in [("{", "}"), ("[", "]")]:
+                start = content.find(start_char)
+                end = content.rfind(end_char)
+                if start != -1 and end > start:
+                    candidate = content[start : end + 1]
+                    try:
+                        _json.loads(candidate)
+                        return candidate
+                    except (ValueError, TypeError):
+                        pass
+        return content
+
+
+class JsonFenceStripper:
+    """Strips markdown code fences from streaming JSON responses.
+
+    Buffers the first few characters to detect and remove ``json\\n or ```\\n
+    at the start, and holds back the last 4 characters to strip trailing
+    \\n``` at the end.  Call flush() after the last delta.
+    """
+
+    _OPEN_FENCES = ("```json\n", "```json\r\n", "```\n", "```\r\n")
+    _CLOSE_FENCE = "\n```"
+    _MAX_OPEN_LEN = 10  # max("```json\r\n") = 10
+    _CLOSE_LEN = 4  # len("\n```")
+
+    def __init__(self):
+        self._head_buffer = ""
+        self._head_stripped = False
+        self._tail_buffer = ""
+
+    def process_delta(self, text: str) -> str:
+        """Process a streaming delta. Returns text safe to emit."""
+        # Phase 1: detect and strip opening fence
+        if not self._head_stripped:
+            self._head_buffer += text
+            # Check if buffer matches any fence exactly (or starts with one)
+            for fence in self._OPEN_FENCES:
+                if self._head_buffer.startswith(fence):
+                    self._head_stripped = True
+                    self._head_buffer = self._head_buffer[len(fence) :]
+                    text = self._head_buffer
+                    self._head_buffer = ""
+                    break
+            if not self._head_stripped:
+                if len(self._head_buffer) >= self._MAX_OPEN_LEN:
+                    # Exceeded max fence length with no match — not a fence
+                    self._head_stripped = True
+                    text = self._head_buffer
+                    self._head_buffer = ""
+                else:
+                    # Check if buffer could still match a fence prefix
+                    could_match = any(f.startswith(self._head_buffer) for f in self._OPEN_FENCES)
+                    if not could_match:
+                        self._head_stripped = True
+                        text = self._head_buffer
+                        self._head_buffer = ""
+                    else:
+                        return ""  # Still accumulating
+
+        # Phase 2: hold back last _CLOSE_LEN chars for closing fence
+        self._tail_buffer += text
+        if len(self._tail_buffer) > self._CLOSE_LEN:
+            emit = self._tail_buffer[: -self._CLOSE_LEN]
+            self._tail_buffer = self._tail_buffer[-self._CLOSE_LEN :]
+            return emit
+        return ""
+
+    def flush(self) -> str:
+        """Flush remaining buffer. Call at end of stream."""
+        remaining = self._head_buffer + self._tail_buffer
+        self._head_buffer = ""
+        self._tail_buffer = ""
+        self._head_stripped = True
+        # Strip closing fence if present
+        if remaining.endswith("```"):
+            remaining = remaining[:-3]
+            if remaining.endswith("\n"):
+                remaining = remaining[:-1]
+        return remaining
 
 
 class StopSequenceProcessor:

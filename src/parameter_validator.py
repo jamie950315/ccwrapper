@@ -6,7 +6,7 @@ import json
 import logging
 from typing import Dict, Any, List, Optional
 from src.models import ChatCompletionRequest
-from src.constants import CLAUDE_MODELS
+from src.constants import CLAUDE_MODELS, MODEL_ALIASES
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +19,18 @@ class ParameterValidator:
 
     # Valid permission modes for Claude Code SDK
     VALID_PERMISSION_MODES = {"default", "acceptEdits", "bypassPermissions", "plan"}
+
+    @classmethod
+    def resolve_model_alias(cls, model: str) -> str:
+        """Resolve model aliases (e.g. gpt-4o → claude-sonnet-4-6).
+
+        Returns the Claude model name if an alias matches, otherwise the original name.
+        """
+        if model in MODEL_ALIASES:
+            resolved = MODEL_ALIASES[model]
+            logger.info(f"Model alias resolved: '{model}' → '{resolved}'")
+            return resolved
+        return model
 
     @classmethod
     def validate_model(cls, model: str) -> bool:
@@ -154,6 +166,7 @@ class ParameterValidator:
         - X-Claude-Cwd: per-request working directory override
         - X-Claude-Max-Budget-Usd: spending cap for this request
         - X-Claude-Fallback-Model: model to use if primary is unavailable
+        - X-Claude-System-Prompt-Preset: use SDK's preset system prompt ("claude_code")
         """
         extra: Dict[str, Any] = {}
 
@@ -184,6 +197,9 @@ class ParameterValidator:
 
         if "x-claude-fallback-model" in headers:
             extra["fallback_model"] = headers["x-claude-fallback-model"]
+
+        if "x-claude-system-prompt-preset" in headers:
+            extra["system_prompt_preset"] = headers["x-claude-system-prompt-preset"]
 
         return extra
 
