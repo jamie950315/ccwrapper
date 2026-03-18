@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import hashlib
 import logging
 import secrets
 import string
@@ -40,7 +41,7 @@ from src.models import (
     AnthropicUsage,
 )
 from src.claude_cli import ClaudeCodeCLI
-from src.message_adapter import MessageAdapter
+from src.message_adapter import MessageAdapter, StopSequenceProcessor
 from src.auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.session_manager import session_manager
@@ -126,7 +127,6 @@ def prompt_for_api_protection() -> Optional[str]:
 claude_cli = ClaudeCodeCLI(
     timeout=int(os.getenv("MAX_TIMEOUT", "600000")), cwd=os.getenv("CLAUDE_CWD")
 )
-
 
 
 @asynccontextmanager
@@ -391,7 +391,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 
 async def generate_streaming_response(
-    request: ChatCompletionRequest, request_id: str, claude_headers: Optional[Dict[str, Any]] = None
+    request: ChatCompletionRequest,
+    request_id: str,
+    claude_headers: Optional[Dict[str, Any]] = None,
+    extra_sdk_options: Optional[Dict[str, Any]] = None,
 ) -> AsyncGenerator[str, None]:
     """Generate SSE formatted streaming response."""
     last_chunk: Optional[dict] = None  # Only keep last non-StreamEvent chunk (memory-safe)
@@ -412,6 +415,14 @@ async def generate_streaming_response(
             else:
                 system_prompt = sampling_instructions
             logger.debug(f"Added sampling instructions: {sampling_instructions}")
+
+        # Add JSON format instructions if response_format is set
+        json_instructions = request.get_json_instructions()
+        if json_instructions:
+            if system_prompt:
+                system_prompt = f"{system_prompt}\n\n{json_instructions}"
+            else:
+                system_prompt = json_instructions
 
         # Filter content for unsupported features
         prompt = MessageAdapter.filter_content(prompt)
@@ -441,6 +452,16 @@ async def generate_streaming_response(
             claude_options["permission_mode"] = "bypassPermissions"
             logger.info(f"Tools enabled by user request: {DEFAULT_ALLOWED_TOOLS}")
 
+        # Initialize stop sequence processor
+        stop_processor = None
+        if request.stop:
+            seqs = [request.stop] if isinstance(request.stop, str) else request.stop
+            stop_processor = StopSequenceProcessor(seqs)
+        stopped_by_sequence = False
+
+        # System fingerprint
+        sys_fp = f"fp_{hashlib.md5(request.model.encode()).hexdigest()[:10]}"
+
         # Run Claude Code
         role_sent = False  # Track if we've sent the initial role chunk
         content_sent = False  # Track if we've sent any content
@@ -454,6 +475,8 @@ async def generate_streaming_response(
             allowed_tools=claude_options.get("allowed_tools"),
             disallowed_tools=claude_options.get("disallowed_tools"),
             permission_mode=claude_options.get("permission_mode"),
+            max_thinking_tokens=claude_options.get("max_thinking_tokens"),
+            extra_sdk_options=extra_sdk_options,
             stream=True,
         ):
             # --- Handle StreamEvent (token-level delta) for real-time streaming ---
@@ -464,6 +487,9 @@ async def generate_streaming_response(
             # avoid unbounded buffer growth on long responses.
             if stream_event is None:
                 last_chunk = chunk
+            if stopped_by_sequence:
+                continue  # Drain remaining SDK messages
+
             if stream_event is not None:
                 event_type = stream_event.get("type", "") if isinstance(stream_event, dict) else ""
 
@@ -475,6 +501,16 @@ async def generate_streaming_response(
                     if delta_type == "text_delta":
                         delta_text = delta.get("text", "")
                         if delta_text:
+                            # Apply stop sequence processing
+                            if stop_processor:
+                                delta_text = stop_processor.process_delta(delta_text)
+                                if stop_processor.stopped:
+                                    stopped_by_sequence = True
+                                if not delta_text:
+                                    if stopped_by_sequence:
+                                        continue
+                                    continue  # Buffered, nothing to emit yet
+
                             # Send initial role chunk if we haven't already
                             if not role_sent:
                                 initial_chunk = ChatCompletionStreamResponse(
@@ -487,6 +523,7 @@ async def generate_streaming_response(
                                             finish_reason=None,
                                         )
                                     ],
+                                    system_fingerprint=sys_fp,
                                 )
                                 yield f"data: {initial_chunk.model_dump_json()}\n\n"
                                 role_sent = True
@@ -501,6 +538,7 @@ async def generate_streaming_response(
                                         finish_reason=None,
                                     )
                                 ],
+                                system_fingerprint=sys_fp,
                             )
                             yield f"data: {stream_chunk.model_dump_json()}\n\n"
                             content_sent = True
@@ -584,6 +622,38 @@ async def generate_streaming_response(
                         yield f"data: {stream_chunk.model_dump_json()}\n\n"
                         content_sent = True
 
+        # Flush stop processor buffer (remaining held-back text)
+        if stop_processor and not stopped_by_sequence:
+            remaining = stop_processor.flush()
+            if remaining:
+                if not role_sent:
+                    init_c = ChatCompletionStreamResponse(
+                        id=request_id,
+                        model=request.model,
+                        choices=[
+                            StreamChoice(
+                                index=0,
+                                delta={"role": "assistant", "content": ""},
+                                finish_reason=None,
+                            )
+                        ],
+                        system_fingerprint=sys_fp,
+                    )
+                    yield f"data: {init_c.model_dump_json()}\n\n"
+                    role_sent = True
+                flush_chunk = ChatCompletionStreamResponse(
+                    id=request_id,
+                    model=request.model,
+                    choices=[
+                        StreamChoice(index=0, delta={"content": remaining}, finish_reason=None)
+                    ],
+                    system_fingerprint=sys_fp,
+                )
+                yield f"data: {flush_chunk.model_dump_json()}\n\n"
+                content_sent = True
+            if stop_processor.stopped:
+                stopped_by_sequence = True
+
         # Handle case where no role was sent (send at least role chunk)
         if not role_sent:
             # Send role chunk with empty content if we never got any assistant messages
@@ -595,6 +665,7 @@ async def generate_streaming_response(
                         index=0, delta={"role": "assistant", "content": ""}, finish_reason=None
                     )
                 ],
+                system_fingerprint=sys_fp,
             )
             yield f"data: {initial_chunk.model_dump_json()}\n\n"
             role_sent = True
@@ -644,6 +715,7 @@ async def generate_streaming_response(
             model=request.model,
             choices=[StreamChoice(index=0, delta={}, finish_reason="stop")],
             usage=usage_data,
+            system_fingerprint=sys_fp,
         )
         yield f"data: {final_chunk.model_dump_json()}\n\n"
         yield "data: [DONE]\n\n"
@@ -685,6 +757,7 @@ async def chat_completions(
 
         # Extract Claude-specific parameters from headers
         claude_headers = ParameterValidator.extract_claude_headers(dict(request.headers))
+        extra_sdk_options = ParameterValidator.extract_extra_sdk_headers(dict(request.headers))
 
         # Log compatibility info
         if logger.isEnabledFor(logging.DEBUG):
@@ -694,7 +767,9 @@ async def chat_completions(
         if request_body.stream:
             # Return streaming response
             return StreamingResponse(
-                generate_streaming_response(request_body, request_id, claude_headers),
+                generate_streaming_response(
+                    request_body, request_id, claude_headers, extra_sdk_options
+                ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -725,6 +800,14 @@ async def chat_completions(
                 else:
                     system_prompt = sampling_instructions
                 logger.debug(f"Added sampling instructions: {sampling_instructions}")
+
+            # Add JSON format instructions if response_format is set
+            json_instructions = request_body.get_json_instructions()
+            if json_instructions:
+                if system_prompt:
+                    system_prompt = f"{system_prompt}\n\n{json_instructions}"
+                else:
+                    system_prompt = json_instructions
 
             # Filter content
             prompt = MessageAdapter.filter_content(prompt)
@@ -764,6 +847,8 @@ async def chat_completions(
                 allowed_tools=claude_options.get("allowed_tools"),
                 disallowed_tools=claude_options.get("disallowed_tools"),
                 permission_mode=claude_options.get("permission_mode"),
+                max_thinking_tokens=claude_options.get("max_thinking_tokens"),
+                extra_sdk_options=extra_sdk_options,
                 stream=False,
             ):
                 chunks.append(chunk)
@@ -778,6 +863,21 @@ async def chat_completions(
             # Filter out tool usage and thinking blocks
             assistant_content = MessageAdapter.filter_content(raw_assistant_content)
 
+            # Apply stop sequence truncation
+            finish_reason = "stop"
+            if request_body.stop:
+                seqs = (
+                    [request_body.stop] if isinstance(request_body.stop, str) else request_body.stop
+                )
+                assistant_content, _ = StopSequenceProcessor.truncate(assistant_content, seqs)
+
+            # Clean JSON response if json mode was requested
+            if request_body.response_format and request_body.response_format.type in (
+                "json_object",
+                "json_schema",
+            ):
+                assistant_content = MessageAdapter.clean_json_response(assistant_content)
+
             # Add assistant response to session if using session mode
             if actual_session_id:
                 assistant_message = Message(role="assistant", content=assistant_content)
@@ -787,6 +887,9 @@ async def chat_completions(
             prompt_tokens = MessageAdapter.estimate_tokens(prompt)
             completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
 
+            # System fingerprint
+            sys_fp = f"fp_{hashlib.md5(request_body.model.encode()).hexdigest()[:10]}"
+
             # Create response
             response = ChatCompletionResponse(
                 id=request_id,
@@ -795,7 +898,7 @@ async def chat_completions(
                     Choice(
                         index=0,
                         message=Message(role="assistant", content=assistant_content),
-                        finish_reason="stop",
+                        finish_reason=finish_reason,
                     )
                 ],
                 usage=Usage(
@@ -803,6 +906,7 @@ async def chat_completions(
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
                 ),
+                system_fingerprint=sys_fp,
             )
 
             return response
@@ -963,9 +1067,7 @@ async def check_compatibility(request_body: ChatCompletionRequest):
 @rate_limit_endpoint("health")
 async def health_check(request: Request):
     """Health check endpoint with actual SDK and auth status."""
-    sdk_ready = (
-        claude_cli._active_client is not None or bool(claude_cli._standby_clients)
-    )
+    sdk_ready = claude_cli._active_client is not None or bool(claude_cli._standby_clients)
     auth_valid, _ = validate_claude_code_auth()
     status = "healthy" if (sdk_ready and auth_valid) else "degraded"
     return {

@@ -2,6 +2,7 @@ from typing import List, Optional, Dict, Any, Union, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime
 import uuid
+import json
 import logging
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,13 @@ class ContentPart(BaseModel):
 
     type: Literal["text"]
     text: str
+
+
+class ResponseFormat(BaseModel):
+    """OpenAI response_format parameter for structured output."""
+
+    type: Literal["text", "json_object", "json_schema"] = "text"
+    json_schema: Optional[Dict[str, Any]] = None
 
 
 class Message(BaseModel):
@@ -76,6 +84,14 @@ class ChatCompletionRequest(BaseModel):
         default=False,
         description="Enable Claude Code tools (Read, Write, Bash, etc.) - disabled by default for OpenAI compatibility",
     )
+    response_format: Optional[ResponseFormat] = Field(
+        default=None,
+        description="Output format constraint. 'json_object' forces JSON output, 'json_schema' enforces a specific schema.",
+    )
+    seed: Optional[int] = Field(
+        default=None,
+        description="Accepted for compatibility but ignored (Claude does not support deterministic sampling)",
+    )
     stream_options: Optional[StreamOptions] = Field(
         default=None, description="Options for streaming responses"
     )
@@ -124,7 +140,19 @@ class ChatCompletionRequest(BaseModel):
             warnings.append("logit_bias is not supported and will be ignored")
 
         if self.stop:
-            warnings.append("stop sequences are not supported and will be ignored")
+            info_messages.append(
+                "stop sequences will be applied via post-processing (output truncation)"
+            )
+
+        if self.seed is not None:
+            info_messages.append(
+                f"seed={self.seed} accepted but ignored (no deterministic sampling)"
+            )
+
+        if self.response_format and self.response_format.type != "text":
+            info_messages.append(
+                f"response_format={self.response_format.type} will be applied via system prompt injection"
+            )
 
         for msg in info_messages:
             logger.info(f"OpenAI API compatibility: {msg}")
@@ -169,6 +197,29 @@ class ChatCompletionRequest(BaseModel):
                 )
 
         return " ".join(instructions) if instructions else None
+
+    def get_json_instructions(self) -> Optional[str]:
+        """Generate system prompt instructions for response_format."""
+        if self.response_format is None or self.response_format.type == "text":
+            return None
+
+        if self.response_format.type == "json_object":
+            return (
+                "You must respond with valid JSON only. "
+                "Do not include any text, explanation, or markdown formatting outside the JSON object. "
+                "The response must be parseable by a standard JSON parser."
+            )
+
+        if self.response_format.type == "json_schema" and self.response_format.json_schema:
+            schema_str = json.dumps(self.response_format.json_schema, indent=2)
+            return (
+                "You must respond with valid JSON that conforms to the following JSON schema. "
+                "Do not include any text, explanation, or markdown formatting outside the JSON object. "
+                "The response must be parseable by a standard JSON parser.\n\n"
+                f"JSON Schema:\n```json\n{schema_str}\n```"
+            )
+
+        return None
 
     def to_claude_options(self) -> Dict[str, Any]:
         """Convert OpenAI request parameters to Claude Code SDK options."""

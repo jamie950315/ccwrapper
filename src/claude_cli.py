@@ -182,10 +182,13 @@ class ClaudeCodeCLI:
         """
         async with self._client_lock:
             if self._active_client is not None and (
-                self._needs_recycle
-                or self._client_request_count >= self._client_max_requests
+                self._needs_recycle or self._client_request_count >= self._client_max_requests
             ):
-                reason = "session isolation" if self._needs_recycle else f"{self._client_request_count} requests"
+                reason = (
+                    "session isolation"
+                    if self._needs_recycle
+                    else f"{self._client_request_count} requests"
+                )
                 logger.info(f"Recycling active client ({reason})")
                 await self._kill_one_client(self._active_client)
                 self._active_client = None
@@ -196,9 +199,7 @@ class ClaudeCodeCLI:
                 if self._standby_clients:
                     self._active_client = self._standby_clients.pop(0)
                     remaining = len(self._standby_clients)
-                    logger.info(
-                        f"Swapped in standby client (zero-latency, {remaining} remaining)"
-                    )
+                    logger.info(f"Swapped in standby client (zero-latency, {remaining} remaining)")
                     # Refill immediately — overlaps with API call (~2s head start).
                     # Safe with cascade pattern: each task creates ONE client and exits.
                     if remaining < self._max_standby:
@@ -253,6 +254,8 @@ class ClaudeCodeCLI:
         allowed_tools: Optional[List[str]],
         disallowed_tools: Optional[List[str]],
         permission_mode: Optional[str],
+        max_thinking_tokens: Optional[int] = None,
+        extra_sdk_options: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Check if request can use the persistent client (fast path).
 
@@ -264,6 +267,10 @@ class ClaudeCodeCLI:
         explicitly for the default (no-tools) path; None would only arrive
         from direct callers that didn't specify tools, which is compatible
         with the client's empty-tools configuration.
+
+        Requests with extra SDK options (betas, env, cwd override, etc.) or
+        max_thinking_tokens must use the slow path since the persistent
+        client has fixed options.
         """
         if max_turns != 1:
             return False
@@ -272,6 +279,10 @@ class ClaudeCodeCLI:
         if disallowed_tools is not None:
             return False
         if permission_mode is not None:
+            return False
+        if max_thinking_tokens is not None:
+            return False
+        if extra_sdk_options:
             return False
         return True
 
@@ -326,12 +337,19 @@ class ClaudeCodeCLI:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         permission_mode: Optional[str] = None,
+        max_thinking_tokens: Optional[int] = None,
+        extra_sdk_options: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Agent using the Python SDK and yield response chunks."""
 
         try:
             use_persistent = self._can_use_persistent_client(
-                max_turns, allowed_tools, disallowed_tools, permission_mode,
+                max_turns,
+                allowed_tools,
+                disallowed_tools,
+                permission_mode,
+                max_thinking_tokens,
+                extra_sdk_options,
             )
 
             # Backpressure: reject early instead of queueing indefinitely
@@ -350,13 +368,22 @@ class ClaudeCodeCLI:
             try:
                 # Persistent client: use asyncio.Lock for exclusive access.
                 # If lock is already held, fall back to slow path immediately.
-                if (use_persistent and not session_id and not continue_session):
+                if use_persistent and not session_id and not continue_session:
                     if self._fast_path_lock.locked():
                         # Another request owns the persistent client — slow path
                         async for msg in self._run_via_query(
-                            prompt, system_prompt, model, stream, max_turns,
-                            allowed_tools, disallowed_tools, session_id,
-                            continue_session, permission_mode,
+                            prompt,
+                            system_prompt,
+                            model,
+                            stream,
+                            max_turns,
+                            allowed_tools,
+                            disallowed_tools,
+                            session_id,
+                            continue_session,
+                            permission_mode,
+                            max_thinking_tokens,
+                            extra_sdk_options,
                         ):
                             yield msg
                     else:
@@ -365,9 +392,18 @@ class ClaudeCodeCLI:
                                 yield msg
                 else:
                     async for msg in self._run_via_query(
-                        prompt, system_prompt, model, stream, max_turns,
-                        allowed_tools, disallowed_tools, session_id,
-                        continue_session, permission_mode,
+                        prompt,
+                        system_prompt,
+                        model,
+                        stream,
+                        max_turns,
+                        allowed_tools,
+                        disallowed_tools,
+                        session_id,
+                        continue_session,
+                        permission_mode,
+                        max_thinking_tokens,
+                        extra_sdk_options,
                     ):
                         yield msg
             finally:
@@ -430,7 +466,9 @@ class ClaudeCodeCLI:
 
             # Embed system prompt into user prompt for the persistent client
             if system_prompt and system_prompt != _DEFAULT_SYSTEM_PROMPT:
-                prompt = f"<system_instructions>\n{system_prompt}\n</system_instructions>\n\n{prompt}"
+                prompt = (
+                    f"<system_instructions>\n{system_prompt}\n</system_instructions>\n\n{prompt}"
+                )
 
             await client.query(prompt, session_id=sid)
 
@@ -480,6 +518,8 @@ class ClaudeCodeCLI:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         permission_mode: Optional[str] = None,
+        max_thinking_tokens: Optional[int] = None,
+        extra_sdk_options: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Slow path: stateless query() with full option flexibility."""
         options = ClaudeAgentOptions(
@@ -504,10 +544,21 @@ class ClaudeCodeCLI:
         if permission_mode:
             options.permission_mode = permission_mode
 
+        if max_thinking_tokens is not None:
+            options.max_thinking_tokens = max_thinking_tokens
+
         if continue_session:
             options.continue_session = True
         elif session_id:
             options.resume = session_id
+
+        # Apply extra SDK options (betas, fork_session, env, cwd, etc.)
+        if extra_sdk_options:
+            for key, value in extra_sdk_options.items():
+                if hasattr(options, key):
+                    setattr(options, key, value)
+                else:
+                    logger.warning(f"Unknown SDK option '{key}' ignored")
 
         try:
             async with asyncio.timeout(self.timeout):
