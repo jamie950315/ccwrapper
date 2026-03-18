@@ -531,7 +531,18 @@ class ClaudeCodeCLI:
         if model:
             options.model = model
 
-        if system_prompt:
+        # Handle system prompt: preset mode or text mode
+        preset = extra_sdk_options.pop("system_prompt_preset", None) if extra_sdk_options else None
+        if preset:
+            if system_prompt:
+                options.system_prompt = {
+                    "type": "preset",
+                    "preset": preset,
+                    "append": system_prompt,
+                }
+            else:
+                options.system_prompt = {"type": "preset", "preset": preset}
+        elif system_prompt:
             options.system_prompt = {"type": "text", "text": system_prompt}
         else:
             options.system_prompt = {"type": "text", "text": _DEFAULT_SYSTEM_PROMPT}

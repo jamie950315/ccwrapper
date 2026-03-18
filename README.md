@@ -345,12 +345,57 @@ poetry run bandit -r src/ -ll -x tests
 | `n > 1` | Not supported (single completion only) |
 | `presence_penalty`, `frequency_penalty`, `logit_bias` | Accepted, ignored (no SDK equivalent) |
 | `logprobs` / `top_logprobs` | Not supported (Claude doesn't expose token probabilities) |
-| `tools` / `functions` / `tool_choice` | Not supported (use `enable_tools` for Claude's native tools) |
+| `tools` / `tool_choice` | Simulated via system prompt injection + response parsing |
+
+### Function Calling (tools)
+
+OpenAI-compatible function calling is simulated via system prompt injection:
+
+```python
+response = client.chat.completions.create(
+    model="claude-sonnet-4-6",
+    messages=[{"role": "user", "content": "What's the weather in Tokyo?"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"],
+            },
+        },
+    }],
+)
+
+if response.choices[0].finish_reason == "tool_calls":
+    tool_calls = response.choices[0].message.tool_calls
+    # Execute tool calls and send results back...
+```
+
+Supports `tool_choice` ("auto", "none", "required", or specific tool). The `tool` role message is accepted for multi-turn tool use flows.
+
+> This is a simulation — Claude doesn't natively support OpenAI's function calling format. Tool definitions are injected into the system prompt and Claude's response is parsed for structured tool call blocks. Works well for most use cases but complex multi-tool scenarios may need testing.
+
+### Model Aliasing
+
+OpenAI model names are automatically mapped to Claude equivalents:
+
+| OpenAI Model | Maps To | Tier |
+|-------------|---------|------|
+| `gpt-4o`, `gpt-4-turbo` | `claude-sonnet-4-6` | Balanced |
+| `gpt-4`, `o1`, `o3` | `claude-opus-4-6` | Premium |
+| `gpt-4o-mini`, `gpt-3.5-turbo`, `gpt-4.1-mini` | `claude-haiku-4-5` | Fast |
+| `gpt-4.1` | `claude-sonnet-4-6` | Balanced |
+| `gemini-1.5-pro`, `deepseek-chat` | `claude-sonnet-4-6` | Balanced |
+
+Native Claude model names pass through unchanged.
 
 ## Current Limitations
 
 - Image content in messages is converted to text placeholders (Claude Agent SDK doesn't accept images)
-- OpenAI function calling / tool definitions not supported — use `enable_tools` for Claude's built-in tools instead
+- Function calling is simulated (not native) — works for most frameworks but may have edge cases
 - `n > 1` (multiple completions per request) not supported
 - Token counts are estimates (~4 chars/token ASCII, ~1.5 chars/token CJK), not exact
 

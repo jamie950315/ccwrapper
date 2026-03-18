@@ -30,10 +30,42 @@ class ResponseFormat(BaseModel):
     json_schema: Optional[Dict[str, Any]] = None
 
 
+class ToolCallFunction(BaseModel):
+    """Function details within a tool call."""
+
+    name: str
+    arguments: str  # JSON string
+
+
+class ToolCall(BaseModel):
+    """OpenAI tool_call format."""
+
+    id: str
+    type: Literal["function"] = "function"
+    function: ToolCallFunction
+
+
+class FunctionDef(BaseModel):
+    """OpenAI function definition."""
+
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+
+
+class ToolDef(BaseModel):
+    """OpenAI tool definition."""
+
+    type: Literal["function"] = "function"
+    function: FunctionDef
+
+
 class Message(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: Union[str, List[ContentPart]]
+    role: Literal["system", "user", "assistant", "tool"]
+    content: Union[str, List[ContentPart], None] = None
     name: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
+    tool_call_id: Optional[str] = None
 
     @model_validator(mode="after")
     def normalize_content(self):
@@ -91,6 +123,18 @@ class ChatCompletionRequest(BaseModel):
     seed: Optional[int] = Field(
         default=None,
         description="Accepted for compatibility but ignored (Claude does not support deterministic sampling)",
+    )
+    tools: Optional[List[ToolDef]] = Field(
+        default=None,
+        description="OpenAI function calling: tool definitions. Simulated via system prompt injection.",
+    )
+    tool_choice: Optional[Any] = Field(
+        default=None,
+        description="Tool selection: 'auto', 'none', 'required', or specific tool object.",
+    )
+    parallel_tool_calls: Optional[bool] = Field(
+        default=None,
+        description="Accepted for compatibility (Claude always considers parallel calls).",
     )
     stream_options: Optional[StreamOptions] = Field(
         default=None, description="Options for streaming responses"
@@ -253,13 +297,19 @@ class ChatCompletionRequest(BaseModel):
 class Choice(BaseModel):
     index: int
     message: Message
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "null"]] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "tool_calls", "null"]] = (
+        None
+    )
 
 
 class Usage(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    # Claude SDK cost extensions (ignored by standard OpenAI clients)
+    total_cost_usd: Optional[float] = Field(default=None, exclude=None)
+    duration_ms: Optional[int] = Field(default=None, exclude=None)
+    num_turns: Optional[int] = Field(default=None, exclude=None)
 
 
 class ChatCompletionResponse(BaseModel):

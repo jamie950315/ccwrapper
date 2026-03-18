@@ -25,6 +25,8 @@ from src.models import (
     Message,
     Usage,
     StreamChoice,
+    ToolCall,
+    ToolCallFunction,
     SessionListResponse,
     ToolListResponse,
     ToolMetadataResponse,
@@ -41,7 +43,8 @@ from src.models import (
     AnthropicUsage,
 )
 from src.claude_cli import ClaudeCodeCLI
-from src.message_adapter import MessageAdapter, StopSequenceProcessor
+from src.message_adapter import MessageAdapter, StopSequenceProcessor, JsonFenceStripper
+from src.function_calling import build_tools_system_prompt, parse_tool_calls, convert_tool_messages
 from src.auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.session_manager import session_manager
@@ -424,6 +427,17 @@ async def generate_streaming_response(
             else:
                 system_prompt = json_instructions
 
+        # Add function calling tool definitions to system prompt
+        has_tools = bool(request.tools)
+        if has_tools:
+            tool_defs = [t.model_dump() for t in request.tools]
+            tool_choice = request.tool_choice or "auto"
+            tools_prompt = build_tools_system_prompt(tool_defs, tool_choice)
+            if system_prompt:
+                system_prompt = f"{system_prompt}\n\n{tools_prompt}"
+            else:
+                system_prompt = tools_prompt
+
         # Filter content for unsupported features
         prompt = MessageAdapter.filter_content(prompt)
         if system_prompt:
@@ -436,8 +450,11 @@ async def generate_streaming_response(
         if claude_headers:
             claude_options.update(claude_headers)
 
-        # Validate model
+        # Resolve model aliases (e.g. gpt-4o → claude-sonnet-4-6) and validate
         if claude_options.get("model"):
+            claude_options["model"] = ParameterValidator.resolve_model_alias(
+                claude_options["model"]
+            )
             ParameterValidator.validate_model(claude_options["model"])
 
         # Handle tools - disabled by default for OpenAI compatibility
@@ -458,6 +475,14 @@ async def generate_streaming_response(
             seqs = [request.stop] if isinstance(request.stop, str) else request.stop
             stop_processor = StopSequenceProcessor(seqs)
         stopped_by_sequence = False
+
+        # Initialize JSON fence stripper for streaming json mode
+        json_stripper = None
+        if request.response_format and request.response_format.type in (
+            "json_object",
+            "json_schema",
+        ):
+            json_stripper = JsonFenceStripper()
 
         # System fingerprint
         sys_fp = f"fp_{hashlib.md5(request.model.encode()).hexdigest()[:10]}"
@@ -510,6 +535,12 @@ async def generate_streaming_response(
                                     if stopped_by_sequence:
                                         continue
                                     continue  # Buffered, nothing to emit yet
+
+                            # Strip JSON code fences in streaming json mode
+                            if json_stripper and delta_text:
+                                delta_text = json_stripper.process_delta(delta_text)
+                                if not delta_text:
+                                    continue  # Buffered in fence stripper
 
                             # Send initial role chunk if we haven't already
                             if not role_sent:
@@ -622,6 +653,36 @@ async def generate_streaming_response(
                         yield f"data: {stream_chunk.model_dump_json()}\n\n"
                         content_sent = True
 
+        # Flush JSON fence stripper buffer
+        if json_stripper:
+            json_remaining = json_stripper.flush()
+            if json_remaining:
+                if not role_sent:
+                    init_j = ChatCompletionStreamResponse(
+                        id=request_id,
+                        model=request.model,
+                        choices=[
+                            StreamChoice(
+                                index=0,
+                                delta={"role": "assistant", "content": ""},
+                                finish_reason=None,
+                            )
+                        ],
+                        system_fingerprint=sys_fp,
+                    )
+                    yield f"data: {init_j.model_dump_json()}\n\n"
+                    role_sent = True
+                json_flush = ChatCompletionStreamResponse(
+                    id=request_id,
+                    model=request.model,
+                    choices=[
+                        StreamChoice(index=0, delta={"content": json_remaining}, finish_reason=None)
+                    ],
+                    system_fingerprint=sys_fp,
+                )
+                yield f"data: {json_flush.model_dump_json()}\n\n"
+                content_sent = True
+
         # Flush stop processor buffer (remaining held-back text)
         if stop_processor and not stopped_by_sequence:
             remaining = stop_processor.flush()
@@ -702,10 +763,15 @@ async def generate_streaming_response(
         if request.stream_options and request.stream_options.include_usage:
             completion_text = assistant_content or ""
             token_usage = claude_cli.estimate_token_usage(prompt, completion_text, request.model)
+            # Extract SDK cost data from last chunk (ResultMessage)
+            sdk_meta = claude_cli.extract_metadata([last_chunk] if last_chunk else [])
             usage_data = Usage(
                 prompt_tokens=token_usage["prompt_tokens"],
                 completion_tokens=token_usage["completion_tokens"],
                 total_tokens=token_usage["total_tokens"],
+                total_cost_usd=sdk_meta.get("total_cost_usd") or None,
+                duration_ms=sdk_meta.get("duration_ms") or None,
+                num_turns=sdk_meta.get("num_turns") or None,
             )
             logger.debug(f"Estimated usage: {usage_data}")
 
@@ -809,6 +875,17 @@ async def chat_completions(
                 else:
                     system_prompt = json_instructions
 
+            # Add function calling tool definitions to system prompt
+            has_tools_ns = bool(request_body.tools)
+            if has_tools_ns:
+                tool_defs_ns = [t.model_dump() for t in request_body.tools]
+                tool_choice_ns = request_body.tool_choice or "auto"
+                tools_prompt_ns = build_tools_system_prompt(tool_defs_ns, tool_choice_ns)
+                if system_prompt:
+                    system_prompt = f"{system_prompt}\n\n{tools_prompt_ns}"
+                else:
+                    system_prompt = tools_prompt_ns
+
             # Filter content
             prompt = MessageAdapter.filter_content(prompt)
             if system_prompt:
@@ -821,8 +898,11 @@ async def chat_completions(
             if claude_headers:
                 claude_options.update(claude_headers)
 
-            # Validate model
+            # Resolve model aliases and validate
             if claude_options.get("model"):
+                claude_options["model"] = ParameterValidator.resolve_model_alias(
+                    claude_options["model"]
+                )
                 ParameterValidator.validate_model(claude_options["model"])
 
             # Handle tools - disabled by default for OpenAI compatibility
@@ -853,8 +933,9 @@ async def chat_completions(
             ):
                 chunks.append(chunk)
 
-            # Extract assistant message and free buffer
+            # Extract assistant message, metadata, and free buffer
             raw_assistant_content = claude_cli.parse_claude_message(chunks)
+            sdk_meta = claude_cli.extract_metadata(chunks)
             chunks.clear()
 
             if not raw_assistant_content:
@@ -878,14 +959,36 @@ async def chat_completions(
             ):
                 assistant_content = MessageAdapter.clean_json_response(assistant_content)
 
+            # Parse function calling tool_calls from response
+            response_tool_calls = None
+            if has_tools_ns:
+                parsed_calls, remaining_text = parse_tool_calls(assistant_content)
+                if parsed_calls:
+                    response_tool_calls = [
+                        ToolCall(
+                            id=tc["id"],
+                            function=ToolCallFunction(
+                                name=tc["function"]["name"],
+                                arguments=tc["function"]["arguments"],
+                            ),
+                        )
+                        for tc in parsed_calls
+                    ]
+                    assistant_content = remaining_text  # May be None
+                    finish_reason = "tool_calls"
+
             # Add assistant response to session if using session mode
             if actual_session_id:
-                assistant_message = Message(role="assistant", content=assistant_content)
+                assistant_message = Message(
+                    role="assistant",
+                    content=assistant_content,
+                    tool_calls=response_tool_calls,
+                )
                 session_manager.add_assistant_response(actual_session_id, assistant_message)
 
-            # Estimate tokens (rough approximation)
+            # Estimate tokens
             prompt_tokens = MessageAdapter.estimate_tokens(prompt)
-            completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
+            completion_tokens = MessageAdapter.estimate_tokens(assistant_content or "")
 
             # System fingerprint
             sys_fp = f"fp_{hashlib.md5(request_body.model.encode()).hexdigest()[:10]}"
@@ -897,7 +1000,11 @@ async def chat_completions(
                 choices=[
                     Choice(
                         index=0,
-                        message=Message(role="assistant", content=assistant_content),
+                        message=Message(
+                            role="assistant",
+                            content=assistant_content,
+                            tool_calls=response_tool_calls,
+                        ),
                         finish_reason=finish_reason,
                     )
                 ],
@@ -905,6 +1012,9 @@ async def chat_completions(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
+                    total_cost_usd=sdk_meta.get("total_cost_usd") or None,
+                    duration_ms=sdk_meta.get("duration_ms") or None,
+                    num_turns=sdk_meta.get("num_turns") or None,
                 ),
                 system_fingerprint=sys_fp,
             )
