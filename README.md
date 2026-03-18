@@ -1,4 +1,4 @@
-# Claude Code OpenAI Wrapper
+# ccwrapper
 
 Drop-in OpenAI API server backed by Claude. Point any OpenAI-compatible client at this wrapper and it talks to Claude via the official [Claude Agent SDK](https://docs.anthropic.com/en/docs/claude-code/sdk).
 
@@ -90,6 +90,76 @@ client.chat.completions.create(
 ```
 
 Sessions expire after 1 hour of inactivity. Each session holds up to 200 messages. Expired sessions are cleaned up automatically every 5 minutes.
+
+### JSON Mode (response_format)
+
+Force structured JSON output:
+
+```python
+response = client.chat.completions.create(
+    model="claude-sonnet-4-6",
+    messages=[{"role": "user", "content": "List 3 colors as JSON"}],
+    response_format={"type": "json_object"},
+)
+```
+
+Or enforce a specific schema:
+
+```python
+response = client.chat.completions.create(
+    model="claude-sonnet-4-6",
+    messages=[{"role": "user", "content": "Extract the person"}],
+    response_format={
+        "type": "json_schema",
+        "json_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+        },
+    },
+)
+```
+
+### Stop Sequences
+
+Truncate output at specified stop sequences:
+
+```python
+response = client.chat.completions.create(
+    model="claude-sonnet-4-6",
+    messages=[{"role": "user", "content": "Count: 1, 2, 3, 4, 5"}],
+    stop=[","],  # Output stops at the first comma
+)
+```
+
+Works with both streaming and non-streaming. For streaming, uses a hold-back buffer to correctly detect stop sequences that span across chunk boundaries.
+
+### Claude SDK Headers
+
+Pass Claude Agent SDK options via custom HTTP headers for advanced control:
+
+| Header | SDK Option | Example |
+|--------|-----------|---------|
+| `X-Claude-Max-Turns` | `max_turns` | `5` |
+| `X-Claude-Max-Thinking-Tokens` | `max_thinking_tokens` | `10000` |
+| `X-Claude-Allowed-Tools` | `allowed_tools` | `Read,Bash,Grep` |
+| `X-Claude-Disallowed-Tools` | `disallowed_tools` | `WebFetch,WebSearch` |
+| `X-Claude-Permission-Mode` | `permission_mode` | `bypassPermissions` |
+| `X-Claude-Beta` | `betas` | `context-1m-2025-08-07` |
+| `X-Claude-Fork-Session` | `fork_session` | `true` |
+| `X-Claude-Env` | `env` | `{"MY_VAR": "value"}` (JSON) |
+| `X-Claude-Cwd` | `cwd` | `/path/to/project` |
+| `X-Claude-Max-Budget-Usd` | `max_budget_usd` | `1.50` |
+| `X-Claude-Fallback-Model` | `fallback_model` | `claude-haiku-4-5` |
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Claude-Beta: context-1m-2025-08-07" \
+  -H "X-Claude-Max-Thinking-Tokens: 10000" \
+  -d '{"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+> Requests with extra SDK headers (betas, env, cwd, etc.) route to the slow path since the persistent client has fixed options.
 
 ### curl
 
@@ -218,7 +288,7 @@ claude_cli.py → Claude Agent SDK
 Key modules:
 
 - **`claude_cli.py`** — Dual-path SDK wrapper with triple-buffered session isolation. Active client serves the request; up to 2 standby clients are pre-warmed in background via cascade pattern for instant swap. If a standby is mid-preparation when needed, the request waits via `asyncio.Event` rather than cold-starting a duplicate. SIGKILL fallback ensures subprocess cleanup. `asyncio.Lock` enforces exclusive fast-path access; `asyncio.timeout()` guards against subprocess hangs; 30s backpressure on semaphore rejects overload early.
-- **`message_adapter.py`** — Converts between OpenAI and Claude formats. Strips thinking blocks, extracts `attempt_completion` results, CJK-aware token estimation.
+- **`message_adapter.py`** — Converts between OpenAI and Claude formats. Strips thinking blocks, extracts `attempt_completion` results, CJK-aware token estimation. Includes `StopSequenceProcessor` for streaming stop-sequence detection with hold-back buffer, and JSON response cleaning.
 - **`session_manager.py`** — In-memory session store. 1-hour TTL, 200-message cap, background cleanup, thread-safe.
 - **`auth.py`** — Multi-provider auth with auto-detection.
 - **`tool_manager.py`** — Tool metadata and per-session allow/deny lists.
@@ -262,12 +332,27 @@ poetry run mypy src --ignore-missing-imports
 poetry run bandit -r src/ -ll -x tests
 ```
 
+## OpenAI Parameter Compatibility
+
+| Parameter | Status |
+|-----------|--------|
+| `model`, `messages`, `stream` | Fully supported |
+| `response_format` | Supported via system prompt injection (`json_object`, `json_schema`) |
+| `stop` | Supported via post-processing (streaming + non-streaming) |
+| `seed` | Accepted (no effect — Claude has no deterministic sampling) |
+| `temperature`, `top_p` | Best-effort via system prompt approximation |
+| `max_tokens` / `max_completion_tokens` | Mapped to `max_thinking_tokens` (approximate) |
+| `n > 1` | Not supported (single completion only) |
+| `presence_penalty`, `frequency_penalty`, `logit_bias` | Accepted, ignored (no SDK equivalent) |
+| `logprobs` / `top_logprobs` | Not supported (Claude doesn't expose token probabilities) |
+| `tools` / `functions` / `tool_choice` | Not supported (use `enable_tools` for Claude's native tools) |
+
 ## Current Limitations
 
-- Image content in messages is converted to text placeholders
-- OpenAI parameters `temperature`, `top_p`, `max_tokens`, `logit_bias`, `presence_penalty`, `frequency_penalty` are accepted but not mapped
-- `n > 1` (multiple completions) not supported
-- Function calling / tool_choice not supported (use `enable_tools` instead)
+- Image content in messages is converted to text placeholders (Claude Agent SDK doesn't accept images)
+- OpenAI function calling / tool definitions not supported — use `enable_tools` for Claude's built-in tools instead
+- `n > 1` (multiple completions per request) not supported
+- Token counts are estimates (~4 chars/token ASCII, ~1.5 chars/token CJK), not exact
 
 ## Terms Compliance
 
