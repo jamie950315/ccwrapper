@@ -56,6 +56,7 @@ from src.rate_limiter import (
     rate_limit_endpoint,
 )
 from src.constants import CLAUDE_MODELS, CLAUDE_TOOLS, DEFAULT_ALLOWED_TOOLS
+from src.cpu_watchdog import cpu_watchdog
 
 # Load environment variables
 load_dotenv()
@@ -194,11 +195,13 @@ async def lifespan(app: FastAPI):
 
     # Start session cleanup task
     session_manager.start_cleanup_task()
+    cpu_watchdog.start()
 
     yield
 
     # Cleanup on shutdown
     logger.info("Shutting down...")
+    cpu_watchdog.stop()
     await claude_cli.shutdown()
     session_manager.shutdown()
 
